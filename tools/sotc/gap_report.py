@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""List the imports of a linked game image that the host runtime does not serve yet.
+
+Reads out/link.json (link_modules.py), names each NID through shadPS4's aerolib.inl and marks
+the ones whose symbol name already appears in a runtime export table (src/, gpu/shim/).
+"""
+import argparse
+import collections
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def aerolib(path):
+    return dict(re.findall(r'STUB\("([A-Za-z0-9+\-]{11})", ([^)]+)\)', path.read_text(encoding='utf-8')))
+
+
+def runtime_text():
+    parts = []
+    for folder in (ROOT / 'src', ROOT / 'gpu' / 'shim'):
+        for f in folder.rglob('*'):
+            if f.suffix in ('.c', '.cpp', '.h', '.inc'):
+                parts.append(f.read_text(encoding='utf-8', errors='replace'))
+    return '\n'.join(parts)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('link_json', type=Path)
+    p.add_argument('--aerolib', type=Path, required=True)
+    p.add_argument('--json', type=Path)
+    a = p.parse_args()
+    names = aerolib(a.aerolib)
+    text = runtime_text()
+    groups = collections.defaultdict(list)
+    for imp in json.loads(a.link_json.read_text(encoding='utf-8'))['unresolved_imports']:
+        nid, _, library = imp.partition('#')
+        symbol = names.get(nid, '?')
+        served = f'"{imp}"' in text or re.search(rf'"{re.escape(symbol)}"', text) is not None
+        groups[library].append((symbol, nid, served))
+    rows = []
+    for library, items in sorted(groups.items(), key=lambda kv: -sum(not s for *_, s in kv[1])):
+        missing = [i for i in items if not i[2]]
+        if not missing:
+            continue
+        print(f'{library}: {len(missing)} missing of {len(items)}')
+        for symbol, nid, _ in sorted(missing):
+            print(f'    {nid}  {symbol}')
+            rows.append(dict(library=library, nid=nid, symbol=symbol))
+    print(f'Total missing: {len(rows)}')
+    if a.json:
+        a.json.write_text(json.dumps(rows, indent=1) + '\n', encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

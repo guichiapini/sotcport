@@ -23,6 +23,33 @@ from link_libc import encode_id
 from cpu_compat import atomic_output, patch_image, patch_libc
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
+
+# Import names carry dump-local library/module IDs (`NID#lib#mod`); the host runtime matches the
+# spelling of CUSA03173's eboot. Other games (CUSA08809) number their libraries differently, so
+# each import is respelled from its (library, module) identity. Unlisted libraries: NID#library.
+CANONICAL_SUFFIX = {
+    'libc': 'q#q', 'libkernel': 'p#J', 'libScePosix': 'I#J', 'libSceGnmDriver': 'B#C',
+    'libSceVideoOut': 'C#D', 'libScePad': 'A#B', 'libSceUserService': 'D#E', 'libSceNet': 'E#F',
+    'libSceFios2': 'F#G', 'libSceAudioOut': 'G#H', 'libSceRtc': 'H#I', 'libSceNetCtl': 'J#K',
+    'libSceHttp': 'K#L', 'libSceSsl': 'L#M', 'libSceSysmodule': 'M#N', 'libSceAjm': 'N#O',
+    'libSceSaveData': 'O#P', 'libSceNpMatching2': 'P#Q', 'libSceNpCommon': 'Q#R',
+    'libSceNpManager': 'R#S', 'libSceNpLookup': 'S#T', 'libSceNpSignaling': 'T#U',
+    'libSceMouse': 'U#V', 'libSceSystemService': 'V#W', 'libSceNpWebApi': 'W#X',
+    'libSceNpAuth': 'X#Y', 'libSceAudioIn': 'Y#Z', 'libSceCommonDialog': 'Z#a',
+    'libSceImeDialog': 'b#c', 'libSceAppContent': 'c#d', 'libSceSaveDataDialog': 'd#e',
+    'libSceNpProfileDialog': 'h#i', 'libSceVoice': 'i#j', 'libSceMsgDialog': 'j#k',
+    'libSceNpCommerceDialog': 'k#l', 'libSceNpTrophy': 'l#m', 'libSceAvPlayer': 'm#n',
+    'libScePlayGo': 'n#o', 'libSceNpScore': 'o#p',
+}
+
+
+def canonical_name(name, identity):
+    """Respell an import in CUSA03173's encoding when its library is one the runtime knows."""
+    if not identity:
+        return name
+    nid, (library, _), _ = identity
+    suffix = CANONICAL_SUFFIX.get(library)
+    return f'{nid}#{suffix}' if suffix else f'{nid}#{library}'
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
 RED_ZONE_SITES = Path(__file__).resolve().parent.parent / 'patches' / 'redzone.json'
 LEA_DOWN = bytes.fromhex('488d642480')        # lea rsp, [rsp-0x80]
@@ -274,6 +301,10 @@ def link(game, out, module_names=DEFAULT_MODULES):
                           tls_filesz=tls['filesz'] if tls else 0, tls_module=module_id,
                           tls_relocations=tls_relocations, exports=count, sha256=m['sha256']))
         base = (base + modsize + 65535) & ~65535
+
+    if os.environ.get('BB_CANONICAL_IMPORTS', '1') == '1':
+        for identity, index in identities.items():
+            names[index] = canonical_name(names[index], identity)
 
     bindings, unresolved = [], []
     for identity, index in identities.items():
