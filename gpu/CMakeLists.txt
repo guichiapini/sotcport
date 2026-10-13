@@ -13,7 +13,7 @@ add_compile_options(-fno-omit-frame-pointer)
 if (MINGW)
     # Headers newer libc++ no longer includes transitively (see the file).
     add_compile_options(
-        "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mingw_libcxx_compat.h>")
+        "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/mingw_libcxx_compat.h\">")
 endif()
 
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
@@ -241,13 +241,28 @@ endif()
 # linked here, where CMake knows its dependencies (build.sh builds them with ninja).
 if (WIN32)
     enable_language(RC)
+    # Resource objects in a short path: CMake names objects of sources outside gpu/ after their
+    # full path, and windres fails past MAX_PATH when the checkout path is long.
+    function(bb_windows_resource name)
+        set(rc "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/${name}.rc")
+        set(obj "${CMAKE_CURRENT_BINARY_DIR}/res/${name}.res.obj")
+        add_custom_command(OUTPUT "${obj}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/res"
+            COMMAND "${CMAKE_RC_COMPILER}" -O coff "${rc}" "${obj}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows"
+            DEPENDS "${rc}" VERBATIM)
+        set(${name}_RES "${obj}" PARENT_SCOPE)
+    endfunction()
+    bb_windows_resource(bb-probe)
+    bb_windows_resource(bb-gpu-capabilities)
+    bb_windows_resource(play)
     file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
     file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
     add_library(atrac9 STATIC ${BB_ATRAC9})
     target_compile_options(atrac9 PRIVATE -w)
     set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
     add_executable(bb-probe ../src/probe.c ${BB_RUNTIME} ../src/compat_win.c ../src/vulkan_smoke.c
-        ../packaging/windows/bb-probe.rc)
+        ${bb-probe_RES})
     set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
     # Clang 23 added -Wunused-but-set-global (on with -Wall): the runtime keeps a few
@@ -263,10 +278,10 @@ if (WIN32)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
-    add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
+    add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ${bb-gpu-capabilities_RES})
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
     # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
-    add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
+    add_executable(bb-play WIN32 ../packaging/windows/play.c ${play_RES})
     target_compile_options(bb-play PRIVATE -municode)
     target_link_options(bb-play PRIVATE -municode)
 endif()
