@@ -117,12 +117,27 @@ static void *initial_stack(Fiber *f, uintptr_t top) {
     slot[8]=(uint64_t)(uintptr_t)fiber_thunk;  /* top-24 */
     return slot;
 }
+/* Fibers with a context run on a host stack of that size, not on the guest memory the game
+ * gave: that memory sits among GPU buffers whose pages the GPU tracker write-protects, and a
+ * fault on a protected stack page leaves Windows no stack to deliver the exception on, so the
+ * process ended silently (0xc0000005, CUSA08809 with direct GPU memory access). Guest threads
+ * already run on host stacks. context_start/context_end hold the host stack. */
+static uintptr_t host_stack_top(Fiber *f) {
+    if (!f->context_start || f->context_start==f->addr_context) {
+        size_t size=(f->size_context+65535)&~(size_t)65535;
+        if (size<UINT64_C(256)*1024) size=UINT64_C(256)*1024;   /* host frames are larger */
+        void *stack=runtime_low_map(size,3 /* read|write */);
+        if (!stack) { fprintf(stderr,"STOP: no host stack for fiber '%s'\n",f->name); exit(22); }
+        f->context_start=stack; f->context_end=(char *)stack+size;
+    }
+    return (uintptr_t)f->context_end;
+}
 /* Stack pointer to enter f with; prepares its first frame when it has not started. */
 static void *enter_sp(Fiber *f, uintptr_t below) {
     FiberTls *t=fiber_tls();
     if (f->saved_sp && f->addr_context) return f->saved_sp;
     t->starting=f;
-    uintptr_t top=f->addr_context ? (uintptr_t)f->addr_context+f->size_context : below-NO_CONTEXT_GAP;
+    uintptr_t top=f->addr_context ? host_stack_top(f) : below-NO_CONTEXT_GAP;
     return initial_stack(f,top);
 }
 static int valid(const Fiber *f) { return f->magic_start==SIGNATURE0 && f->magic_end==SIGNATURE1; }

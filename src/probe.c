@@ -276,6 +276,18 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (!runtime_fault_recover) {
+            /* Before anything that could fault again: raw addresses through the OS handle. */
+            static long raw_logged;
+            if (InterlockedIncrement(&raw_logged)<=16) {
+                char line[192];
+                int n=snprintf(line,sizeof(line),"AV: rip=%p address=%p kind=%llu thread=%lu image=%p\n",
+                               (void *)info->ContextRecord->Rip,(void *)record->ExceptionInformation[1],
+                               (unsigned long long)record->ExceptionInformation[0],GetCurrentThreadId(),(void *)image);
+                DWORD written;
+                WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)(n>0 ? n : 0),&written,NULL);
+            }
+        }
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
              * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
@@ -299,6 +311,16 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
                  (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
                  !module;
         if (ours) return fatal_exception(info);
+        /* Left to the module's own handlers; the first ones are logged, since one that nobody
+         * handles ends the process without the report below (CUSA08809: 0xc0000005 exits). */
+        static int foreign_logged;
+        if (__atomic_fetch_add(&foreign_logged,1,__ATOMIC_RELAXED)<8) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),rip);
+            fprintf(stderr,"Foreign exception 0x%08lx at %s (thread %lu, address %p)\n",code,where,GetCurrentThreadId(),
+                    record->NumberParameters>=2 ? (void *)record->ExceptionInformation[1] : NULL);
+            fflush(stderr);
+        }
     }
     /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
     if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);

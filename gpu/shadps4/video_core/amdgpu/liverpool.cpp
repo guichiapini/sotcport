@@ -915,7 +915,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // bbport (sotc): CUSA08809 only clears the predicate (operation 0) here, so
+                // nothing is skipped; the warning flooded the log thousands of times a minute.
                 break;
             }
             case PM4ItOpcode::IndexType: {

@@ -1223,14 +1223,21 @@ Id EmitContext::DefineGetBdaPointer() {
 
     // Get page BDA
     const auto page{OpShiftRightLogical(U64, address, caching_pagebits)};
-    const auto page32{OpUConvert(U32[1], page)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
+    // bbport (sotc): an address past the page table (a garbage pointer, e.g. one the SRT walker
+    // could not resolve) read past the table and the GPU then dereferenced that value: the device
+    // faulted and the driver ended the process. Such pages read as unavailable (null), and page 0
+    // stands in for them in both table accesses. The table has an entry for each page of the
+    // buffer cache's 40-bit address space (BufferCache::ADDRESS_SPACE_BITS).
+    const auto in_range{OpULessThan(U1[1], address, Constant(U64, u64{1} << 40))};
+    const auto page32{OpSelect(U32[1], in_range, OpUConvert(U32[1], page), u32_zero_value)};
     const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
     const auto bda{OpLoad(U64, bda_ptr)};
 
     // Check if page is GPU cached
-    const auto is_fault{OpIEqual(U1[1], bda, u64_zero_value)};
+    const auto is_fault{
+        OpLogicalOr(U1[1], OpLogicalNot(U1[1], in_range), OpIEqual(U1[1], bda, u64_zero_value))};
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     OpBranchConditional(is_fault, fault_label, available_label);
 
@@ -1240,7 +1247,9 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto [fault_buffer_id, fault_pointer_type] = fault_buffer.Alias(PointerType::U32);
     const auto page_div32{OpShiftRightLogical(U32[1], page32, ConstU32(5U))};
     const auto page_mod32{OpBitwiseAnd(U32[1], page32, ConstU32(31U))};
-    const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
+    const auto page_mask{OpSelect(U32[1], in_range,
+                                  OpShiftLeftLogical(U32[1], u32_one_value, page_mod32),
+                                  u32_zero_value)};
     const auto fault_ptr{
         OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
     const auto fault_value{OpLoad(U32[1], fault_ptr)};

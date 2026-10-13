@@ -71,7 +71,21 @@ def main():
     clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
     env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
     env.setdefault('BB_CONFIG', str(user / 'sotcport.ini'))
-    env.setdefault('BB_GPU_USER_DIR', str(user))
+    # The renderer's Bloodborne features hook that game's shaders and render targets
+    # (temporal upscalers, object motion through instrumented vertex shaders, live render
+    # resolution); CUSA08809 starts with all of them off.
+    config = Path(env['BB_CONFIG'])
+    if not config.exists():
+        config.write_text('# sotcport settings\nupscaler=off\nobject_motion=0\nlive_resolution=0\n'
+                          'show_fps=1\n', encoding='utf-8')
+    env.setdefault('BB_DLSS', '0')
+    env.setdefault('BB_LIVE_RES', '0')
+    # Shaders read guest memory directly when an offset is only known as they run: the
+    # culling compute shaders index their tables in loops, and the flattened copy they read
+    # otherwise culled the scenery away. Pipeline caches do not record this setting, so each
+    # value keeps its own GPU folder.
+    env.setdefault('BB_DIRECT_MEMORY_ACCESS', '1')
+    env.setdefault('BB_GPU_USER_DIR', str(user / f"gpu-dma{env['BB_DIRECT_MEMORY_ACCESS']}"))
     env.setdefault('BB_VBLANK_HZ', '60')
     env.setdefault('BB_HEARTBEAT', '10')
     # Guest memory copies run on the GPU command thread, the one thread whose protection
@@ -99,7 +113,11 @@ def main():
             log.flush()
             sys.stdout.buffer.write(line)
             sys.stdout.buffer.flush()
-        return process.wait()
+        code = process.wait()
+        message = f'run_sotc: game exited with code {code} (0x{code & 0xffffffff:08x})\n'.encode()
+        log.write(message)
+        sys.stdout.buffer.write(message)
+        return code
 
 
 if __name__ == '__main__':

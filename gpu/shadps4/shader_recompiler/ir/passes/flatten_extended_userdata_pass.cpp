@@ -638,6 +638,8 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
 
+static thread_local u64 srt_shader_hash; // bbport (sotc): shader being walked, for errors
+
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
                          Xbyak::CodeGenerator& c) {
     if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
@@ -647,7 +649,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     }
 
     if (!PushPtr(c, pass_info, off_dw)) {
-        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#018x})", srt_shader_hash);
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
@@ -663,7 +665,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#018x})", srt_shader_hash);
                 continue;
             }
             c.shl(r10d, 2);
@@ -688,6 +690,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 
 static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     Xbyak::CodeGenerator& c = g_srt_codegen;
+    srt_shader_hash = info.pgm_hash; // bbport (sotc): named in walker errors
 
     if (pass_info.srt_roots.empty()) {
         return;
