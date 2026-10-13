@@ -84,4 +84,12 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+/* CUSA08809 libraries and functions (runtime_sotc*.c). */
+uintptr_t runtime_sotc_resolve(const char *name);
+uintptr_t runtime_sotc_resolve_data(const char *name);
+uintptr_t runtime_fiber_resolve(const char *name);
+uintptr_t runtime_ngs2_resolve(const char *name);
+uintptr_t runtime_audio3d_resolve(const char *name);
+void runtime_fiber_report(void);
+void runtime_sotc_audio_report(void);
 #endif

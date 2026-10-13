@@ -657,6 +657,21 @@ int main(int argc, char **argv) {
         }
         memcpy(image + relocs[i].target, &value, 8);
     }
+    /* BB_LIST_UNRESOLVED=1: every import still bound to a trap, once each (porting aid). */
+    if (getenv("BB_LIST_UNRESOLVED")) {
+        unsigned char *listed = calloc(import_count + 1, 1);
+        size_t count = 0;
+        for (uint64_t i = 0; listed && i < nr; ++i) {
+            uint64_t id = relocs[i].value;
+            if (!relocs[i].kind || id >= import_count || listed[id]) continue;
+            listed[id] = 1;
+            if (runtime_resolve(names[id], relocs[i].kind == 2) || (native_libc && bindings[id])) continue;
+            printf("Unresolved import: %s (%s)\n", names[id], runtime_import_name(names[id]));
+            ++count;
+        }
+        printf("Unresolved imports: %zu\n", count);
+        free(listed);
+    }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));

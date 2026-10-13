@@ -208,6 +208,37 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
 DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
+/* CUSA08809: closing, results and status of the immediate dialogs. Result layouts begin with
+ * mode, result, button id; button 1 is OK/YES, so confirmation prompts proceed. */
+typedef struct { int32_t mode, result, button; } DialogResult;
+static int32_t dialog_close(int i) {
+    if (!dialogs[i].initialized) return DIALOG_NOT_INITIALIZED;
+    dialogs[i].status=3; return 0;
+}
+static int32_t dialog_result(int i, DialogResult *r) {
+    if (!dialogs[i].initialized) return DIALOG_NOT_INITIALIZED;
+    if (r) { r->result=0; r->button=1; }
+    return 0;
+}
+static ABI int32_t msg_close(void) { return dialog_close(1); }
+static ABI int32_t msg_result(DialogResult *r) { return dialog_result(1,r); }
+static ABI int32_t save_close(const void *p) { (void)p; return dialog_close(2); }
+static ABI int32_t save_result(DialogResult *r) { return dialog_result(2,r); }
+static ABI int32_t save_ready(void) { return 1; }
+static ABI int32_t save_progress(int32_t target, uint32_t rate) { (void)target; (void)rate; return 0; }
+static ABI int32_t common_is_used(void) {
+    for (int i=1;i<6;++i) if (dialogs[i].status==2) return 1;
+    return 0;
+}
+typedef struct { float ratio; uint8_t reserved[128]; } SafeAreaInfo;
+static ABI int32_t safe_area(SafeAreaInfo *info) {
+    if (!info) return (int32_t)0x80A10003;
+    info->ratio=1.0f; return 0;
+}
+static ABI __attribute__((noreturn)) void load_exec(const char *path, char *const *argv) {
+    (void)argv; printf("Runtime: game asked to start %s; ending\n",path ? path : "(null)");
+    runtime_report(); exit(0);
+}
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
  * option, max length, char16 buffer, position, alignment, placeholder, title. */
@@ -288,6 +319,7 @@ static ABI int32_t trophy_context(int32_t *ctx,int32_t user,uint32_t label,uint6
     *ctx=new_id(); return 0;
 }
 static ABI int32_t trophy_handle(int32_t *handle) { if (!handle) return TROPHY_INVALID; *handle=new_id(); return 0; }
+static ABI int32_t trophy_destroy(int32_t id) { (void)id; return 0; }
 static ABI int32_t trophy_register(int32_t ctx,int32_t handle,uint64_t options) { (void)ctx; (void)handle; (void)options; return 0; }
 static ABI int32_t trophy_unlock(int32_t ctx,int32_t handle,int32_t id,int32_t *platinum) {
     (void)ctx; (void)handle;
@@ -474,6 +506,11 @@ static const RuntimeExport exports[]={
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceMsgDialogClose",msg_close}, {"sceMsgDialogGetResult",msg_result},
+    {"sceSaveDataDialogClose",save_close}, {"sceSaveDataDialogGetResult",save_result},
+    {"sceSaveDataDialogGetStatus",save_status}, {"sceSaveDataDialogIsReadyToDisplay",save_ready},
+    {"sceSaveDataDialogProgressBarSetValue",save_progress}, {"sceCommonDialogIsUsed",common_is_used},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area}, {"sceSystemServiceLoadExec",load_exec},
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},
@@ -482,6 +519,7 @@ static const RuntimeExport exports[]={
     {"sceImeDialogInit",ime_init}, {"sceImeDialogGetStatus",ime_status}, {"sceImeDialogGetResult",ime_result},
     {"sceImeDialogTerm",ime_term}, {"sceImeDialogAbort",ime_term},
     {"sceNpTrophyCreateContext",trophy_context}, {"sceNpTrophyCreateHandle",trophy_handle},
+    {"sceNpTrophyDestroyContext",trophy_destroy}, {"sceNpTrophyDestroyHandle",trophy_destroy},
     {"sceNpTrophyRegisterContext",trophy_register}, {"sceNpTrophyUnlockTrophy",trophy_unlock},
     {"sceNpTrophyGetGameInfo",trophy_game_info}, {"sceNpTrophyGetTrophyInfo",trophy_info},
     {"scePlayGoInitialize",playgo_init}, {"scePlayGoOpen",playgo_open}, {"scePlayGoGetChunkId",playgo_chunk_ids},

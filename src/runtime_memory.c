@@ -40,6 +40,10 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+/* Fixed mappings may also target the PS4's system-managed range below the image (CUSA08809
+ * maps at 0x7f0000000); [FIXED_LOW_MIN, FIXED_LOW_MAX) is reserved for them. */
+#define FIXED_LOW_MIN UINT64_C(0x400000000)
+#define FIXED_LOW_MAX UINT64_C(0x800000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -141,6 +145,11 @@ void runtime_memory_reserve(void) {
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
     region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
+    if (VirtualAlloc2(NULL,(void *)FIXED_LOW_MIN,FIXED_LOW_MAX-FIXED_LOW_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
+        region_insert(0,(HostRegion){FIXED_LOW_MIN,FIXED_LOW_MAX,0,0});
+    else
+        printf("Runtime: system-managed range 0x%llx-0x%llx unavailable for fixed mappings\n",
+               (unsigned long long)FIXED_LOW_MIN,(unsigned long long)FIXED_LOW_MAX);
 }
 static void view_map(const HostRegion *r, DWORD protect) {
     DWORD initial=protect==PAGE_NOACCESS ? PAGE_READWRITE : protect, old;
@@ -403,6 +412,33 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
 }
 
 static ABI uint64_t direct_size(void) { return POOL_SIZE; }
+/* Largest free stretch of the direct pool in [low, high) at the given alignment (CUSA08809). */
+static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignment, int64_t *start_out, uint64_t *size_out) {
+    if (!alignment) alignment = PAGE;
+    if (!start_out || !size_out || low < 0 || high < 0 || !valid_alignment(alignment)) return INVALID;
+    uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
+    uint64_t best_start = 0, best_size = 0, cursor = (uint64_t)low;
+    read_lock();
+    while (cursor < end) {
+        uint64_t start = align_up(cursor, alignment), stop = end, next = end;
+        for (int i=0; i<LIMIT; ++i) {
+            Block b = blocks[i];
+            if (!b.used || b.start+b.size <= start) continue;
+            if (b.start <= start) { stop = start; next = b.start+b.size; break; }
+            if (b.start < stop) { stop = b.start; next = b.start+b.size; }
+        }
+        if (stop > start && stop-start > best_size) { best_start = start; best_size = stop-start; }
+        cursor = next > cursor ? next : end;
+    }
+    read_unlock();
+    if (!best_size) return NO_MEMORY;
+    *start_out = (int64_t)best_start; *size_out = best_size;
+    return 0;
+}
+static ABI int32_t flexible_available(uint64_t *size) {
+    if (!size) return INVALID;
+    *size = FLEXIBLE_SIZE - flexible_bytes; return 0;
+}
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
@@ -533,6 +569,17 @@ static ABI int32_t map_flexible(void **inout, uint64_t size, int prot, int flags
 static ABI int32_t map_flexible_named(void **inout, uint64_t size, int prot, int flags, const char *name) {
     (void)name; return map_flexible(inout,size,prot,flags);
 }
+/* POSIX mmap of SDK 4.50 libc (CUSA08809): anonymous memory comes from the flexible budget;
+ * file mappings are not supported. FreeBSD flags: MAP_FIXED 0x10, MAP_ANON 0x1000. */
+static ABI void *posix_mmap(void *address, uint64_t size, int prot, int flags, int fd, int64_t offset) {
+    (void)offset;
+    if (!(flags & 0x1000) || fd != -1 || !size) { *runtime_errno() = !size ? 22 : 19; return (void *)-1; }
+    void *at = address;
+    if (map_flexible(&at, align_up(size, PAGE), prot & 7, flags & MAP_FIXED_FLAG)) { *runtime_errno() = 12; return (void *)-1; }
+    return at;
+}
+static ABI int32_t posix_msync(void *address, uint64_t size, int flags) { (void)address; (void)size; (void)flags; return 0; }
+static ABI int32_t kernel_mlock(void *address, uint64_t size) { (void)address; (void)size; return 0; }
 static ABI int32_t release_flexible(void *address, uint64_t size) { return direct_unmap(address,size); }
 static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
@@ -635,6 +682,9 @@ static ABI int32_t batch_map(BatchEntry *entries, int count, int *processed) {
 }
 static const RuntimeExport exports[]={
     {"sceKernelGetDirectMemorySize",direct_size}, {"sceKernelAllocateDirectMemory",direct_allocate},
+    {"sceKernelAvailableDirectMemorySize",direct_available},
+    {"sceKernelAvailableFlexibleMemorySize",flexible_available},
+    {"mmap",posix_mmap}, {"msync",posix_msync}, {"sceKernelMlock",kernel_mlock},
     {"sceKernelMapDirectMemory",direct_map}, {"sceKernelMapNamedDirectMemory",direct_map_named},
     {"sceKernelReleaseDirectMemory",direct_release}, {"sceKernelMunmap",direct_unmap}, {"munmap",direct_unmap},
     {"sceKernelMapFlexibleMemory",map_flexible}, {"sceKernelMapNamedFlexibleMemory",map_flexible_named},

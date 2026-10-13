@@ -294,6 +294,8 @@ static ABI int32_t posix_key_create(uint32_t *k,KeyDestructor d) { int32_t r=key
 static ABI int32_t posix_key_delete(uint32_t k) { int32_t r=key_delete(k); return r ? r&0xffff : 0; }
 static ABI int32_t posix_key_set(uint32_t k,void *v) { int32_t r=key_set(k,v); return r ? r&0xffff : 0; }
 
+/* sceKernelSleep: seconds, kernel error codes (CUSA08809). */
+static ABI int32_t kernel_sleep(uint32_t seconds) { posix_sleep(seconds); return 0; }
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -302,6 +304,7 @@ static const RuntimeExport exports[]={
     {"sceKernelReadTsc",read_tsc}, {"sceKernelGetTscFrequency",tsc_frequency},
     {"sceKernelUsleep",kernel_usleep}, {"usleep",posix_usleep}, {"sleep",posix_sleep},
     {"nanosleep",posix_nanosleep}, {"sceKernelNanosleep",kernel_nanosleep},
+    {"_nanosleep",posix_nanosleep}, {"sceKernelSleep",kernel_sleep},
     {"sceKernelGettimezone",kernel_gettimezone}, {"gettimeofday",posix_gettimeofday},
     {"sceKernelGettimeofday",kernel_gettimeofday},
     {"time",posix_time},

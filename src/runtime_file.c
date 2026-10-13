@@ -502,7 +502,36 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
-static int64_t do_read(int fd,void *buffer,uint64_t size) {
+/* Windows pread/pwrite move the descriptor's file pointer and restore it (compat_win.c). Without
+ * a lock, a pread on one thread restores a stale pointer over another thread's lseek+read and that
+ * read returns other bytes (CUSA08809: FIOS threads, "InvalidFileFourCC" resources). Operations
+ * on one descriptor are therefore serialized; descriptors share IO_STRIPES locks. */
+#ifdef _WIN32
+#define IO_STRIPES 64
+static pthread_mutex_t io_locks[IO_STRIPES];
+static pthread_once_t io_locks_once=PTHREAD_ONCE_INIT;
+static void io_locks_init(void) { for (int i=0;i<IO_STRIPES;++i) pthread_mutex_init(&io_locks[i],NULL); }
+static pthread_mutex_t *io_lock(int fd) {
+    pthread_once(&io_locks_once,io_locks_init);
+    pthread_mutex_t *m=&io_locks[(unsigned)fd%IO_STRIPES];
+    pthread_mutex_lock(m);
+    return m;
+}
+#define IO_LOCKED(fd,call) do { pthread_mutex_t *m_=io_lock(fd); int64_t r_=(call); pthread_mutex_unlock(m_); return r_; } while (0)
+#else
+#define IO_LOCKED(fd,call) return (call)
+#endif
+static int64_t do_read_unlocked(int fd,void *buffer,uint64_t size);
+static int64_t do_pread_unlocked(int fd,void *buffer,uint64_t size,int64_t offset);
+static int64_t do_write_unlocked(int fd,const void *buffer,uint64_t size);
+static int64_t do_pwrite_unlocked(int fd,const void *buffer,uint64_t size,int64_t offset);
+static int64_t do_lseek_unlocked(int fd,int64_t offset,int whence);
+static int64_t do_read(int fd,void *buffer,uint64_t size) { IO_LOCKED(fd,do_read_unlocked(fd,buffer,size)); }
+static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) { IO_LOCKED(fd,do_pread_unlocked(fd,buffer,size,offset)); }
+static int64_t do_write(int fd,const void *buffer,uint64_t size) { IO_LOCKED(fd,do_write_unlocked(fd,buffer,size)); }
+static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) { IO_LOCKED(fd,do_pwrite_unlocked(fd,buffer,size,offset)); }
+static int64_t do_lseek(int fd,int64_t offset,int whence) { IO_LOCKED(fd,do_lseek_unlocked(fd,offset,whence)); }
+static int64_t do_read_unlocked(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
@@ -511,7 +540,7 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
-static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
+static int64_t do_pread_unlocked(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
@@ -520,7 +549,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
-static int64_t do_write(int fd,const void *buffer,uint64_t size) {
+static int64_t do_write_unlocked(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
     ssize_t n=host_write(h,buffer,size);
@@ -528,13 +557,13 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
 }
-static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
+static int64_t do_pwrite_unlocked(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
     ssize_t n=pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
 }
-static int64_t do_lseek(int fd,int64_t offset,int whence) {
+static int64_t do_lseek_unlocked(int fd,int64_t offset,int whence) {
     File *f=get(fd);
     if (!f) return -EBADF;
     if (whence<0 || whence>2) return -EINVAL;

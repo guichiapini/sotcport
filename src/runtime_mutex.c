@@ -195,6 +195,7 @@ static ABI int32_t cond_abs_timedwait(GuestCond **cond, GuestMutex **mutex, cons
 static int32_t posix_result(int32_t result) { return result ? (int32_t)((uint32_t)result & 0xffff) : 0; }
 static ABI int32_t posix_attr_init(GuestAttr **out) { return posix_result(attr_init(out)); }
 static ABI int32_t posix_attr_type(GuestAttr **attr,int type) { return posix_result(attr_type(attr,type)); }
+static ABI int32_t posix_attr_protocol(GuestAttr **attr,int protocol) { return posix_result(attr_protocol(attr,protocol)); }
 static ABI int32_t posix_attr_destroy(GuestAttr **attr) { return posix_result(attr_destroy(attr)); }
 static ABI int32_t posix_mutex_init(GuestMutex **out,GuestAttr **attr) { return posix_result(mutex_init(out,attr,NULL)); }
 static ABI int32_t posix_mutex_destroy(GuestMutex **m) { return posix_result(mutex_destroy(m)); }
@@ -223,6 +224,7 @@ uintptr_t runtime_mutex_resolve(const char *name) {
     if (!strcmp(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock;
     if (!strcmp(name,"dQHWEsJtoE4#I#J")) return (uintptr_t)posix_attr_init;
     if (!strcmp(name,"mDmgMOGVUqg#I#J")) return (uintptr_t)posix_attr_type;
+    if (!strcmp(name,"5txKfcMUAok#I#J")) return (uintptr_t)posix_attr_protocol;
     if (!strcmp(name,"HF7lK46xzjY#I#J")) return (uintptr_t)posix_attr_destroy;
     if (!strcmp(name,"ttHNfU+qDBU#I#J")) return (uintptr_t)posix_mutex_init;
     if (!strcmp(name,"ltCfaGr2JGE#I#J")) return (uintptr_t)posix_mutex_destroy;

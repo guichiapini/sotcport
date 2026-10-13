@@ -82,6 +82,8 @@ void runtime_report(void) {
     runtime_pad_report();
     runtime_savedata_report();
     runtime_file_report();
+    runtime_fiber_report();
+    runtime_sotc_audio_report();
     printf("Runtime: memory operations=%zu\n", (size_t)memory_calls);
 }
 static ABI void init_env(void) {
@@ -185,7 +187,7 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
         if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
         if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
-        return 0;
+        return runtime_sotc_resolve_data(name);
     }
     /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
     if (!strcmp(name, "bzQExy189ZI#q#q")) return (uintptr_t)init_env;
@@ -236,10 +238,13 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (save) return save;
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
+    uintptr_t sotc = runtime_sotc_resolve(name);
+    if (sotc) return sotc;
     return bbgpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
+#include "import_names_sotc.inc"
 };
 /* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
 const char *runtime_symbol(const char *nid) {

@@ -351,6 +351,35 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }
+/* CUSA08809 additions. Thread ids: the host's, unique while the thread lives. */
+static ABI int32_t thread_get_id(void) {
+#ifdef _WIN32
+    return (int32_t)GetCurrentThreadId();
+#else
+    return (int32_t)syscall(SYS_gettid);
+#endif
+}
+typedef struct { int32_t priority; } GuestSchedParam;
+static ABI int32_t posix_get_sched(GuestThread *t,int32_t *policy,GuestSchedParam *param) {
+    if (!find_thread(t)) return 3;
+    if (policy) *policy=t->attr.policy;
+    if (param) param->priority=t->attr.prio;
+    return 0;
+}
+static ABI int32_t posix_set_sched(GuestThread *t,int32_t policy,const GuestSchedParam *param) {
+    if (!find_thread(t)) return 3;
+    if (!param) return 22;
+    t->attr.policy=policy; t->attr.prio=param->priority; return 0;
+}
+/* No asynchronous cancellation: the request is recorded, the thread keeps running. */
+static ABI int32_t posix_cancel(GuestThread *t) {
+    if (!find_thread(t)) return 3;
+    printf("Runtime: pthread_cancel(%s) ignored (no cancellation points)\n",t->name);
+    return 0;
+}
+/* PS4 priorities: 256 (highest) .. 767 (lowest). */
+static ABI int32_t sched_prio_max(int32_t policy) { (void)policy; return 767; }
+static ABI int32_t sched_prio_min(int32_t policy) { (void)policy; return 256; }
 
 /* POSIX (libScePosix) variants return positive errno values. */
 static int32_t posix(int32_t r) { return r ? (int32_t)((uint32_t)r&0xffff) : 0; }
@@ -398,6 +427,9 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"euKRgm0Vn2M#I#J",posix_attr_set_param}, {"OxhIB8LB-PQ#I#J",posix_create},
         {"Jmi+9w9u0E4#I#J",posix_create_name}, {"h9CcP3J0oVM#I#J",posix_join},
         {"FJrT5LuUBAU#I#J",thread_exit},
+        {"EI-5-jlq2dE#p#J",thread_get_id}, {"FIs3-UQT9sg#I#J",posix_get_sched},
+        {"Xs9hdiD7sAA#I#J",posix_set_sched}, {"0D4-FVvEikw#I#J",posix_cancel},
+        {"CBNtXOoef-E#I#J",sched_prio_max}, {"m0iS6jNsXds#I#J",sched_prio_min},
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (!strcmp(name,table[i].nid)) return (uintptr_t)table[i].fn;

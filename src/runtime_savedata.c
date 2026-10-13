@@ -206,6 +206,24 @@ static ABI int32_t save_umount(const MountPoint *point) {
     pthread_mutex_unlock(&lock);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
+/* CUSA08809: backups are not kept (saves are plain host folders), so there is never one to
+ * check or restore; unmounting "with backup" is an ordinary unmount. */
+static ABI int32_t save_umount_backup(const MountPoint *point) { return save_umount(point); }
+typedef struct { int32_t user; int32_t pad; const void *title, *dir; uint8_t reserved[32]; } BackupParam;
+static ABI int32_t save_backup_absent(const BackupParam *param) {
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    return param ? ERR_NOT_FOUND : ERR_PARAMETER;
+}
+static ABI int32_t save_mount_info(const MountPoint *point, SearchInfo *info) {
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    if (!point || !info) return ERR_PARAMETER;
+    pthread_mutex_lock(&lock);
+    int slot=slot_of(point);
+    pthread_mutex_unlock(&lock);
+    if (slot<0) return ERR_NOT_MOUNTED;
+    memset(info,0,sizeof(*info)); info->blocks=32768; info->free_blocks=16384;
+    return 0;
+}
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!buffer) return ERR_PARAMETER;
@@ -354,6 +372,8 @@ static const RuntimeExport exports[]={
     {"sceSaveDataDirNameSearch",save_search},
     {"sceSaveDataSetupSaveDataMemory",memory_setup}, {"sceSaveDataGetSaveDataMemory",memory_get},
     {"sceSaveDataSetSaveDataMemory",memory_set},
+    {"sceSaveDataUmountWithBackup",save_umount_backup}, {"sceSaveDataGetMountInfo",save_mount_info},
+    {"sceSaveDataCheckBackupData",save_backup_absent}, {"sceSaveDataRestoreBackupData",save_backup_absent},
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
