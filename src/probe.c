@@ -13,6 +13,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -182,6 +183,62 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
         return;
     }
     snprintf(out,size,"%p",(void *)address);
+}
+/* Every other thread's position and rbp chain (hang diagnosis, BB_HEARTBEAT). Each thread is
+ * suspended only while its registers and frames are read; names and modules are looked up
+ * after it runs again, as a suspended thread may hold the loader or heap lock. */
+void probe_dump_threads(void) {
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (snapshot==INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry={.dwSize=sizeof(entry)};
+    DWORD self=GetCurrentThreadId(), pid=GetCurrentProcessId();
+    fprintf(stderr,"Thread dump:\n");
+    for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
+        if (entry.th32OwnerProcessID!=pid || entry.th32ThreadID==self) continue;
+        HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
+        if (!thread) continue;
+        uintptr_t frames[32]; int count=0;
+        CONTEXT c={.ContextFlags=CONTEXT_FULL};
+        if (SuspendThread(thread)!=(DWORD)-1) {
+            if (GetThreadContext(thread,&c)) {
+                /* Host code has unwind tables (ntdll keeps no frame pointer); guest code has
+                 * none but keeps rbp chains. */
+                while (count<32 && c.Rip) {
+                    frames[count++]=(uintptr_t)c.Rip;
+                    DWORD64 base=0;
+                    PRUNTIME_FUNCTION function=RtlLookupFunctionEntry(c.Rip,&base,NULL);
+                    if (function) {
+                        void *handler; DWORD64 establisher;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,c.Rip,function,&c,&handler,&establisher,NULL);
+                    } else if (image && (uintptr_t)c.Rip-(uintptr_t)image<0x20000000) {
+                        uintptr_t frame[2]; SIZE_T got=0;
+                        if (!c.Rbp || !ReadProcessMemory(GetCurrentProcess(),(void *)c.Rbp,frame,sizeof(frame),&got) ||
+                            got!=sizeof(frame) || frame[0]<=c.Rbp) break;
+                        c.Rsp=c.Rbp+16; c.Rip=frame[1]; c.Rbp=frame[0];
+                    } else {
+                        uintptr_t ret; SIZE_T got=0;   /* leaf function: return address on top */
+                        if (!ReadProcessMemory(GetCurrentProcess(),(void *)c.Rsp,&ret,sizeof(ret),&got) || got!=sizeof(ret)) break;
+                        c.Rip=ret; c.Rsp+=8;
+                    }
+                }
+            }
+            ResumeThread(thread);
+        }
+        char name[128]="";
+        PWSTR wide=NULL;
+        if (SUCCEEDED(GetThreadDescription(thread,&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        CloseHandle(thread);
+        fprintf(stderr,"  thread %lu '%s'\n",entry.th32ThreadID,name);
+        for (int i=0;i<count;++i) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),frames[i]);
+            fprintf(stderr,"    #%d %s\n",i,where);
+        }
+    }
+    CloseHandle(snapshot);
 }
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {

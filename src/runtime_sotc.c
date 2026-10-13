@@ -21,6 +21,7 @@
 #define ESRCH_ 3
 #define EBUSY_ 16
 #define EINVAL_ 22
+#define EACCES_ 13
 #define ENOMEM_ 12
 #define ETIMEDOUT_ 60
 #define ECANCELED_ 85
@@ -78,19 +79,30 @@ static ABI int32_t kernel_local_to_utc(int64_t local, int64_t unused, int64_t *u
     return 0;
 }
 
-/* ---- event flags (sceKernel*EventFlag): 64-bit pattern, AND/OR waits, optional clear ---- */
+/* ---- event flags (sceKernel*EventFlag): 64-bit pattern, AND/OR waits, optional clear ----
+ * sceKernelSetEventFlag hands the pattern to the queued waiters it satisfies, in queue order,
+ * and applies each one's clear mode there and then, as the PS4 kernel does. Waiters that only
+ * re-checked the pattern after waking missed short pulses (set, then cleared by the setter or
+ * consumed by another waiter) and slept forever: CUSA08809's job workers, loader and render
+ * threads all ended up waiting at once. */
 #define EF_WAIT_AND 1
 #define EF_WAIT_OR 2
 #define EF_CLEAR_ALL 0x10
 #define EF_CLEAR_PAT 0x20
 #define EF_ATTR_MULTI 0x20
+typedef struct EfWaiter {
+    uint64_t bits, result;
+    uint32_t mode;
+    int ready, canceled, deleted;
+    struct EfWaiter *next;
+} EfWaiter;
 typedef struct EventFlag {
     uint32_t magic;
     pthread_mutex_t lock;
     pthread_cond_t changed;
     uint64_t pattern;
-    int multi, waiters, cancelled, deleted;
-    uint64_t generation;
+    int multi, deleted;
+    EfWaiter *waiters;   /* FIFO */
     char name[32];
 } EventFlag;
 #define EF_MAGIC UINT32_C(0x45464c47)
@@ -98,14 +110,25 @@ static int ef_valid(EventFlag *f) { return f && f->magic==EF_MAGIC && !f->delete
 static int ef_met(uint64_t pattern, uint64_t bits, uint32_t mode) {
     return (mode&EF_WAIT_AND) ? (pattern&bits)==bits : (pattern&bits)!=0;
 }
-static void ef_consume(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result) {
-    if (result) *result=f->pattern;
+static void ef_clear_for(EventFlag *f, uint64_t bits, uint32_t mode) {
     if (mode&EF_CLEAR_ALL) f->pattern=0;
     else if (mode&EF_CLEAR_PAT) f->pattern&=~bits;
 }
 static int ef_mode_ok(uint64_t bits, uint32_t mode) {
     uint32_t wait=mode&3, clear=mode&0x30;
     return bits && (wait==EF_WAIT_AND || wait==EF_WAIT_OR) && clear!=0x30 && !(mode&~0x33u);
+}
+static void ef_unlink(EventFlag *f, EfWaiter *w) {
+    for (EfWaiter **p=&f->waiters; *p; p=&(*p)->next) if (*p==w) { *p=w->next; return; }
+}
+/* Satisfied waiters take the pattern in queue order (lock held). */
+static void ef_hand_off(EventFlag *f) {
+    int woke=0;
+    for (EfWaiter *w=f->waiters; w; w=w->next) {
+        if (w->ready || w->canceled || w->deleted || !ef_met(f->pattern,w->bits,w->mode)) continue;
+        w->result=f->pattern; ef_clear_for(f,w->bits,w->mode); w->ready=1; woke=1;
+    }
+    if (woke) pthread_cond_broadcast(&f->changed);
 }
 static ABI int32_t ef_create(EventFlag **out, const char *name, uint32_t attr, uint64_t init, const void *opt) {
     (void)opt;
@@ -120,7 +143,9 @@ static ABI int32_t ef_create(EventFlag **out, const char *name, uint32_t attr, u
 static ABI int32_t ef_delete(EventFlag *f) {
     if (!ef_valid(f)) return KERNEL_ERR(ESRCH_);
     pthread_mutex_lock(&f->lock);
-    f->deleted=1; pthread_cond_broadcast(&f->changed);
+    f->deleted=1;
+    for (EfWaiter *w=f->waiters; w; w=w->next) w->deleted=1;
+    pthread_cond_broadcast(&f->changed);
     pthread_mutex_unlock(&f->lock);
     /* Waiters may still be leaving; the object is kept (a few bytes per deleted flag). */
     return 0;
@@ -128,7 +153,8 @@ static ABI int32_t ef_delete(EventFlag *f) {
 static ABI int32_t ef_set(EventFlag *f, uint64_t bits) {
     if (!ef_valid(f)) return KERNEL_ERR(ESRCH_);
     pthread_mutex_lock(&f->lock);
-    f->pattern|=bits; pthread_cond_broadcast(&f->changed);
+    f->pattern|=bits;
+    ef_hand_off(f);
     pthread_mutex_unlock(&f->lock);
     return 0;
 }
@@ -137,40 +163,41 @@ static ABI int32_t ef_clear(EventFlag *f, uint64_t bits) {
     pthread_mutex_lock(&f->lock); f->pattern&=bits; pthread_mutex_unlock(&f->lock);
     return 0;
 }
-static ABI int32_t ef_poll(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result) {
+static int32_t ef_wait_common(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us, int poll) {
     if (!ef_valid(f)) return KERNEL_ERR(ESRCH_);
     if (!ef_mode_ok(bits,mode)) return KERNEL_ERR(EINVAL_);
     pthread_mutex_lock(&f->lock);
-    int32_t r=0;
-    if (!f->multi && f->waiters) r=KERNEL_ERR(EPERM_);
-    else if (ef_met(f->pattern,bits,mode)) ef_consume(f,bits,mode,result);
-    else { if (result) *result=f->pattern; r=KERNEL_ERR(EBUSY_); }
-    pthread_mutex_unlock(&f->lock);
-    return r;
-}
-static ABI int32_t ef_wait(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us) {
-    if (!ef_valid(f)) return KERNEL_ERR(ESRCH_);
-    if (!ef_mode_ok(bits,mode)) return KERNEL_ERR(EINVAL_);
-    struct timespec deadline, start;
+    if (!f->multi && f->waiters) { pthread_mutex_unlock(&f->lock); return KERNEL_ERR(EPERM_); }
+    if (ef_met(f->pattern,bits,mode)) {
+        if (result) *result=f->pattern;
+        ef_clear_for(f,bits,mode);
+        pthread_mutex_unlock(&f->lock);
+        return 0;
+    }
+    if (poll || (timeout_us && !*timeout_us)) {
+        if (result) *result=f->pattern;
+        pthread_mutex_unlock(&f->lock);
+        if (!poll) return KERNEL_ERR(ETIMEDOUT_);
+        return KERNEL_ERR(EBUSY_);
+    }
+    EfWaiter w={.bits=bits,.mode=mode};
+    EfWaiter **tail=&f->waiters;
+    while (*tail) tail=&(*tail)->next;
+    *tail=&w;
+    struct timespec start, deadline;
     clock_gettime(CLOCK_REALTIME,&start);
     if (timeout_us) {
         uint64_t ns=(uint64_t)start.tv_nsec+(uint64_t)*timeout_us*1000;
         deadline.tv_sec=start.tv_sec+(time_t)(ns/1000000000); deadline.tv_nsec=(long)(ns%1000000000);
     }
-    pthread_mutex_lock(&f->lock);
-    if (!f->multi && f->waiters) { pthread_mutex_unlock(&f->lock); return KERNEL_ERR(EPERM_); }
-    ++f->waiters;
-    uint64_t generation=f->generation;
-    int32_t r=0;
-    while (!ef_met(f->pattern,bits,mode)) {
-        if (f->deleted) { r=KERNEL_ERR(EINVAL_); break; }       /* deleted while waiting */
-        if (f->generation!=generation) { r=KERNEL_ERR(ECANCELED_); break; }
+    int timed_out=0;
+    while (!w.ready && !w.canceled && !w.deleted && !timed_out) {
         int e=timeout_us ? pthread_cond_timedwait(&f->changed,&f->lock,&deadline) : pthread_cond_wait(&f->changed,&f->lock);
-        if (e==ETIMEDOUT && !ef_met(f->pattern,bits,mode)) { r=KERNEL_ERR(ETIMEDOUT_); break; }
+        if (e==ETIMEDOUT) timed_out=1;
     }
-    if (!r) ef_consume(f,bits,mode,result);
-    else if (result) *result=f->pattern;
-    --f->waiters;
+    ef_unlink(f,&w);
+    int32_t r=w.ready ? 0 : w.canceled ? KERNEL_ERR(ECANCELED_) : w.deleted ? KERNEL_ERR(EACCES_) : KERNEL_ERR(ETIMEDOUT_);
+    if (result) *result=w.ready || w.canceled ? w.result : f->pattern;
     pthread_mutex_unlock(&f->lock);
     if (timeout_us) {
         struct timespec now; clock_gettime(CLOCK_REALTIME,&now);
@@ -179,11 +206,20 @@ static ABI int32_t ef_wait(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t 
     }
     return r;
 }
+static ABI int32_t ef_poll(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result) {
+    return ef_wait_common(f,bits,mode,result,NULL,1);
+}
+static ABI int32_t ef_wait(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us) {
+    return ef_wait_common(f,bits,mode,result,timeout_us,0);
+}
 static ABI int32_t ef_cancel(EventFlag *f, uint64_t pattern, int32_t *waiters) {
     if (!ef_valid(f)) return KERNEL_ERR(ESRCH_);
     pthread_mutex_lock(&f->lock);
-    if (waiters) *waiters=f->waiters;
-    f->pattern=pattern; ++f->generation; pthread_cond_broadcast(&f->changed);
+    int32_t count=0;
+    for (EfWaiter *w=f->waiters; w; w=w->next) if (!w->ready) { w->canceled=1; w->result=pattern; ++count; }
+    if (waiters) *waiters=count;
+    f->pattern=pattern;
+    pthread_cond_broadcast(&f->changed);
     pthread_mutex_unlock(&f->lock);
     return 0;
 }
@@ -286,6 +322,9 @@ static const struct { const char *name; void *function; } unnamed[]={
 /* BB_HEARTBEAT=<seconds>: periodic progress lines (frames shown, input, files, fibers), to tell
  * a game that waits from one that hangs in automated runs. */
 uint64_t bbgpu_flip_count(void);
+#ifdef _WIN32
+void probe_dump_threads(void);
+#endif
 static void *heartbeat(void *argument) {
     unsigned period=(unsigned)(uintptr_t)argument, elapsed=0;
     for (uint64_t last=0;;) {
@@ -295,6 +334,12 @@ static void *heartbeat(void *argument) {
         uint64_t flips=bbgpu_flip_count();
         /* stderr: unbuffered, so the lines survive a run that is killed. */
         fprintf(stderr,"Heartbeat %us: frames=%llu (+%llu)\n",elapsed,(unsigned long long)flips,(unsigned long long)(flips-last));
+#ifdef _WIN32
+        /* Two periods without a frame: show where every thread waits, once. */
+        static int idle_periods, dumped;
+        idle_periods=flips==last && flips ? idle_periods+1 : 0;
+        if (idle_periods==2 && !dumped) { dumped=1; probe_dump_threads(); }
+#endif
         last=flips;
     }
     return NULL;
