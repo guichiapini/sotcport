@@ -283,6 +283,32 @@ static ABI int32_t discmap_7c98(const char *path, int64_t offset, int64_t size, 
 static const struct { const char *name; void *function; } unnamed[]={
     {"fJgP+wqifno#libSceDiscMap",discmap_7c98},
 };
+/* BB_HEARTBEAT=<seconds>: periodic progress lines (frames shown, input, files, fibers), to tell
+ * a game that waits from one that hangs in automated runs. */
+uint64_t bbgpu_flip_count(void);
+static void *heartbeat(void *argument) {
+    unsigned period=(unsigned)(uintptr_t)argument, elapsed=0;
+    for (uint64_t last=0;;) {
+        struct timespec ts={(time_t)period,0};
+        nanosleep(&ts,NULL);
+        elapsed+=period;
+        uint64_t flips=bbgpu_flip_count();
+        /* stderr: unbuffered, so the lines survive a run that is killed. */
+        fprintf(stderr,"Heartbeat %us: frames=%llu (+%llu)\n",elapsed,(unsigned long long)flips,(unsigned long long)(flips-last));
+        last=flips;
+    }
+    return NULL;
+}
+void runtime_sotc_start(void) {
+    static atomic_int started;
+    const char *v=getenv("BB_HEARTBEAT");
+    if (!v || atoi(v)<=0 || atomic_exchange(&started,1)) return;
+    pthread_t t;
+    if (!pthread_create(&t,NULL,heartbeat,(void *)(uintptr_t)atoi(v))) {
+        pthread_detach(t);
+        fprintf(stderr,"Runtime: heartbeat every %d s\n",atoi(v));
+    }
+}
 uintptr_t runtime_sotc_resolve(const char *name) {
     for (size_t i=0;i<sizeof(unnamed)/sizeof(*unnamed);++i)
         if (!strcmp(name,unnamed[i].name)) return (uintptr_t)unnamed[i].function;

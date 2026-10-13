@@ -87,6 +87,7 @@ void runtime_thread_attach_host(const char *name);
 /* CUSA08809 libraries and functions (runtime_sotc*.c). */
 uintptr_t runtime_sotc_resolve(const char *name);
 uintptr_t runtime_sotc_resolve_data(const char *name);
+void runtime_sotc_start(void);
 uintptr_t runtime_fiber_resolve(const char *name);
 uintptr_t runtime_ngs2_resolve(const char *name);
 uintptr_t runtime_audio3d_resolve(const char *name);

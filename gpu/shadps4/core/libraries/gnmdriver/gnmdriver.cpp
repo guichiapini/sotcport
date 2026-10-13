@@ -1299,15 +1299,6 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
-int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDone() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
-    return ORBIS_OK;
-}
 
 int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
@@ -2306,6 +2297,42 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+}
+
+// bbport (sotc): flip requests without command buffers of their own (CUSA08809 presents with
+// them after its first frames; the stubs left the game waiting for flips that never came).
+// The caller's small buffer gets a PrepareFlip marker patched into a flip request, as upstream
+// shadPS4 does, and is submitted.
+s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gpu_addr,
+                                                           u32 gpu_addr_size_in_bytes,
+                                                           u32 vo_handle, u32 buf_idx,
+                                                           u32 flip_mode, s64 flip_arg) {
+    (void)workload;
+    LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    if (!gpu_addr || gpu_addr_size_in_bytes < 0x100) {
+        return ORBIS_GNM_ERROR_SUBMISSION_NOT_ENOUGH_RESOURCES;
+    }
+    std::scoped_lock lk{m_submit_lock};
+    WaitGpuIdle();
+    auto* nop = reinterpret_cast<PM4CmdNop*>(gpu_addr);
+    nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x3e};
+    nop->data_block[0] = PM4CmdNop::PayloadType::PrepareFlip;
+    const s32 patch_result =
+        PatchFlipRequest(gpu_addr, 0x40, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+    if (patch_result != ORBIS_OK) {
+        return patch_result;
+    }
+    const u32* dcb[] = {gpu_addr};
+    u32 dcb_size[] = {0x100};
+    return PerformSubmit(1, dcb, dcb_size, nullptr, nullptr);
+}
+
+s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDone(u32* gpu_addr, u32 gpu_addr_size_in_bytes,
+                                                u32 vo_handle, u32 buf_idx, u32 flip_mode,
+                                                s64 flip_arg) {
+    return sceGnmRequestFlipAndSubmitDoneForWorkload(reinterpret_cast<u64>(gpu_addr), gpu_addr,
+                                                     gpu_addr_size_in_bytes, vo_handle, buf_idx,
+                                                     flip_mode, flip_arg);
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,

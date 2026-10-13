@@ -60,6 +60,26 @@ static void *allocate(size_t size) {
 #endif
     return p;
 }
+/* The game image below 2 GiB. The PS4 loads executables at 0x400000 and CUSA08809 stores
+ * pointers to its static data in 31-bit fields (high bit = "relative"); above 2 GiB they lose
+ * their upper bits. The first free stretch from 256 MiB up is used; BB_IMAGE_LOW=0 keeps the
+ * image with the other host-owned guest memory. */
+static void *allocate_image(size_t size) {
+    const char *env = getenv("BB_IMAGE_LOW");
+    if (!env || strcmp(env, "0")) {
+        for (uintptr_t at = UINT64_C(0x10000000); at + size <= UINT64_C(0x80000000); at += UINT64_C(0x1000000)) {
+#ifdef _WIN32
+            void *p = VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p) return p;
+#else
+            void *p = mmap((void *)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) return p;
+#endif
+        }
+        puts("Runtime: no free range below 2 GiB for the game image; 31-bit pointers will break");
+    }
+    return allocate(size);
+}
 static void protect(void *p, size_t size, unsigned flags) {
 #ifdef _WIN32
     DWORD old, mode = PAGE_NOACCESS;
@@ -612,7 +632,7 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    image = allocate(round_page(size));
+    image = allocate_image(round_page(size));
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -685,7 +705,7 @@ int main(int argc, char **argv) {
             executable_entry = 1;
     }
     if (!executable_entry) fail("entry is not executable");
-    printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+    printf("Mapped %" PRIu64 " bytes at %p, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, (void *)image, ns, nr);
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;

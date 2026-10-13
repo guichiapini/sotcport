@@ -54,6 +54,7 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
 void runtime_start(uint64_t flags) {
     capabilities = flags;
     if (!(flags & 1)) return;
+    runtime_sotc_start();
 #ifdef _WIN32
     unsigned int halves[2];
     if (rand_s(&halves[0]) || rand_s(&halves[1])) { fputs("Cannot initialize stack canary\n", stderr); exit(1); }

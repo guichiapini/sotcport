@@ -531,11 +531,37 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) { IO_L
 static int64_t do_write(int fd,const void *buffer,uint64_t size) { IO_LOCKED(fd,do_write_unlocked(fd,buffer,size)); }
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) { IO_LOCKED(fd,do_pwrite_unlocked(fd,buffer,size,offset)); }
 static int64_t do_lseek(int fd,int64_t offset,int whence) { IO_LOCKED(fd,do_lseek_unlocked(fd,offset,whence)); }
+#ifdef _WIN32
+/* Windows: the kernel's copy into a page the GPU tracker re-protected after touch_for_write fails
+ * (ERROR_NOACCESS), and the guest gets a short read (CUSA08809: resources with corrupt offsets,
+ * now and then). Reads land in a host buffer and are copied with user-mode writes, which fault
+ * into the tracker's handler like any guest write. offset<0: read at the file pointer. */
+#define BOUNCE_CHUNK (UINT64_C(4)<<20)
+static ssize_t bounced_read(int h,void *buffer,uint64_t size,int64_t offset) {
+    static _Thread_local unsigned char *bounce;
+    if (!bounce && !(bounce=malloc(BOUNCE_CHUNK))) return -1;
+    uint64_t done=0;
+    while (done<size) {
+        uint64_t want=size-done<BOUNCE_CHUNK ? size-done : BOUNCE_CHUNK;
+        ssize_t n=offset<0 ? host_read(h,bounce,(unsigned)want) : pread(h,bounce,want,offset+(int64_t)done);
+        if (n<0) return done ? (ssize_t)done : -1;
+        memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
+        done+=(uint64_t)n;
+        if ((uint64_t)n<want) break;
+    }
+    return (ssize_t)done;
+}
+#define host_read_guest(h,b,n) bounced_read(h,b,n,-1)
+#define host_pread_guest(h,b,n,o) bounced_read(h,b,n,o)
+#else
+#define host_read_guest(h,b,n) host_read(h,b,n)
+#define host_pread_guest(h,b,n,o) pread(h,b,n,o)
+#endif
 static int64_t do_read_unlocked(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
-    ssize_t n=host_read(h,buffer,size);
+    ssize_t n=host_read_guest(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -544,7 +570,7 @@ static int64_t do_pread_unlocked(int fd,void *buffer,uint64_t size,int64_t offse
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
+    ssize_t n=host_pread_guest(h,buffer,size,offset);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

@@ -25,6 +25,10 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+// bbport (sotc): flips performed, for the runtime heartbeat (BB_HEARTBEAT).
+static std::atomic<uint64_t> bb_flips{0};
+extern "C" uint64_t bbgpu_flip_count(void) { return bb_flips.load(std::memory_order_relaxed); }
+
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -486,6 +490,7 @@ void VideoOutDriver::Flip(const Request& req) {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
         flip_status.count++;
+        bb_flips.fetch_add(1, std::memory_order_relaxed);
         flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
         flip_status.flip_arg = req.flip_arg;

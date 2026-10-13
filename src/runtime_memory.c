@@ -553,7 +553,12 @@ static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int fl
     uint64_t phys=flex_alloc(size);
     if (phys==UINT64_MAX) return NO_MEMORY;
     int32_t result=place(inout,size,prot,flags,PAGE,KIND_FLEXIBLE,0,phys);
-    if (result) flex_free(phys,size); else ++flexible_maps;
+    if (result) { flex_free(phys,size); return result; }
+    /* The PS4 kernel hands out flexible memory zeroed and SDK 4.50 libc's mmap-backed calloc
+     * relies on it; released pages come back here with old contents (CUSA08809: stale
+     * "pointers" in fresh allocations). Cleared through the backing view: no tracking faults. */
+    if (backing_base) memset(backing_base+phys,0,size);
+    ++flexible_maps;
     return result;
 }
 static ABI int32_t map_flexible(void **inout, uint64_t size, int prot, int flags) {
