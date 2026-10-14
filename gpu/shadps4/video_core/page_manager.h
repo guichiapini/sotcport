@@ -32,6 +32,9 @@ public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
 
+    /// bbport (sotc): the single-step trap after a read stepped over page protection.
+    static bool OnSingleStep(void* context);
+
     /// Register a range of mapped gpu memory.
     void OnGpuMap(VAddr address, size_t size);
 

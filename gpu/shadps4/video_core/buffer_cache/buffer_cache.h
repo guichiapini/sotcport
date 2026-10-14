@@ -87,7 +87,16 @@ public:
     void ExtendWriteFault(VAddr device_addr);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    /// bbport (sotc): with `not_written`, a read of bytes the GPU did not write downloads
+    /// nothing and sets it (the page is only protected for its neighbours).
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false,
+                    bool* not_written = nullptr);
+
+    /// bbport (sotc): whether GPU-written data (the byte ranges of written bindings, not their
+    /// pages) overlaps the range. GPU thread only.
+    [[nodiscard]] bool BytesGpuWritten(VAddr addr, u64 size) const {
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,

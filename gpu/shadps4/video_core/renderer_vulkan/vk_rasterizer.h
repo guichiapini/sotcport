@@ -134,7 +134,8 @@ public:
     bool IsGpuSideThreadId(u32 tid) const;
     /// A guest write hit a protected page.
     bool OnWriteFault(VAddr addr, bool assume_locks);
-    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false,
+                    bool* not_written = nullptr);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);

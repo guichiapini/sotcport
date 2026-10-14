@@ -153,8 +153,16 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
+                             bool* not_written) {
+    const auto flush_request = [this, device_addr, size, is_write, not_written] {
+        // The faulting access may start before the reported address (it crossed into the
+        // page) and be as wide as a descriptor table load: 64 bytes either way.
+        if (not_written &&
+            !BytesGpuWritten(device_addr >= 64 ? device_addr - 64 : 0, size + 128)) {
+            *not_written = true;
+            return;
+        }
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);

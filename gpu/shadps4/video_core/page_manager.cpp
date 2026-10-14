@@ -138,6 +138,64 @@ struct PageManager::Impl {
         return true;
     }
 
+    /// bbport (sotc): pages opened for reads to one instruction of this thread; the single
+    /// step after it protects them again (two: an access may cross into the next page).
+    static inline thread_local std::array<VAddr, 2> stepped_pages{};
+    static inline std::atomic<u64> stepped_reads{0};
+
+    static void SetTrapFlag(void* context, bool set) {
+#ifdef _WIN32
+        auto* c = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+        c->EFlags = set ? (c->EFlags | 0x100) : (c->EFlags & ~0x100u);
+#else
+        auto* uc = static_cast<ucontext_t*>(context);
+        auto& flags = uc->uc_mcontext.gregs[REG_EFL];
+        flags = set ? (flags | 0x100) : (flags & ~0x100ll);
+#endif
+    }
+
+    bool StepOverRead(void* context, VAddr addr) {
+        const size_t page = addr >> PM_PAGE_BITS;
+        if (page >= NUM_ADDRESS_PAGES) {
+            return false;
+        }
+        auto slot = std::ranges::find(stepped_pages, VAddr{0});
+        if (slot == stepped_pages.end()) {
+            return false; // a third page within one instruction: download instead
+        }
+        {
+            Common::RangeLockGuard lk(locks.begin() + page / PAGES_PER_LOCK,
+                                      locks.begin() + page / PAGES_PER_LOCK + 1);
+            // Reads only: a guest write slipping in meanwhile would go untracked and be
+            // overwritten by the next download of the page.
+            Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, Core::MemoryPermission::Read);
+        }
+        *slot = page << PM_PAGE_BITS;
+        SetTrapFlag(context, true);
+        if (stepped_reads.fetch_add(1, std::memory_order_relaxed) == 0) {
+            std::printf("GPU: reads beside GPU-written bytes step over page protection\n");
+        }
+        return true;
+    }
+
+    bool OnSingleStep(void* context) {
+        if (stepped_pages[0] == 0) {
+            return false;
+        }
+        for (VAddr& page_addr : stepped_pages) {
+            if (!page_addr) {
+                continue;
+            }
+            const size_t page = page_addr >> PM_PAGE_BITS;
+            Common::RangeLockGuard lk(locks.begin() + page / PAGES_PER_LOCK,
+                                      locks.begin() + page / PAGES_PER_LOCK + 1);
+            Protect(page_addr, PM_PAGE_SIZE, cached_pages[page].Perms());
+            page_addr = 0;
+        }
+        SetTrapFlag(context, false);
+        return true;
+    }
+
     virtual void OnMap(VAddr address, size_t size) {
         // No-op
     }
@@ -174,9 +232,22 @@ struct PageManager::Impl {
             if (runtime_fault_recover && !is_gpu_thread) {
                 return false;
             }
+            // bbport (sotc): GPU-side threads read resource tables and shader code next to
+            // GPU-written bytes in the same page; downloading meant a full GPU wait per read
+            // (the main menu ran at 0.5 FPS). Reads of bytes the GPU did not write step over
+            // the protection for one instruction.
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
-            const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            bool not_written = false;
+            const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread, &not_written);
+            if (not_written && instance->ReadWatched(addr) &&
+                instance->StepOverRead(context, addr)) {
+                return true;
+            }
+            if (not_written) {
+                // No step slot left: download after all.
+                rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            }
             if (instance->ReadWatched(addr)) {
                 return instance->EnsureAccess(addr, false);
             }
@@ -515,6 +586,10 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
+
+bool PageManager::OnSingleStep(void* context) {
+    return Impl::instance && Impl::instance->OnSingleStep(context);
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

@@ -281,6 +281,10 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
     return 0;
 }
 
+extern "C" int bbgpu_handle_single_step(void* ucontext) {
+    return VideoCore::PageManager::OnSingleStep(ucontext) ? 1 : 0;
+}
+
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
 }

@@ -3366,7 +3366,7 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
     return true;
 }
 
-bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks, bool* not_written) {
     DrainDrawPipe();
     // bbport (sotc): pages the tracker protected although the game never mapped them for the
     // GPU ("not fully GPU mapped") hold GPU-written data all the same.
@@ -3385,7 +3385,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     static const bool fault_stats = std::getenv("BB_READ_FAULT_STATS") != nullptr;
     const auto start = fault_stats ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
-    buffer_cache.ReadMemory(addr, size, false, assume_locks);
+    buffer_cache.ReadMemory(addr, size, false, assume_locks, not_written);
     if (fault_stats) {
         static std::mutex stats_mutex;
         static std::map<VAddr, u32> regions;
