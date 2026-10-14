@@ -377,12 +377,13 @@ static float pcm_sample(uint32_t type, const uint8_t *s) {
 static void vag_decode(Voice *v, const uint8_t *frame, int ch, float *out, int stride) {
     static const int coef[5][2]={{0,0},{60,0},{115,-52},{98,-55},{122,-60}};
     int shift=frame[0]&0xF, filter=(frame[0]>>4)&0x7;
+    if (shift>12) shift=9;
     if (filter>4) filter=0;
     int16_t *h=v->vag_hist[ch];
     for (int i=0;i<28;++i) {
         int nibble=(frame[2+i/2]>>((i&1)*4))&0xF;
         int s=(int16_t)(nibble<<12)>>shift;
-        s+=(h[0]*coef[filter][0]+h[1]*coef[filter][1])>>6;
+        s+=(h[0]*coef[filter][0]+h[1]*coef[filter][1]+32)>>6;
         if (s>32767) s=32767; else if (s<-32768) s=-32768;
         h[1]=h[0]; h[0]=(int16_t)s;
         out[i*stride]=s/32768.0f;

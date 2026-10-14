@@ -115,6 +115,42 @@ int main(void) {
     CHECK(callbacks==2,"%d block-end callbacks, wanted 2",callbacks);
     flags(voice,&state);
     CHECK(!(state & 0x2) && (state & 0x8),"stopped after the waveform (flags %#x)",state);
+    /* NGS2_TEST_VAG=<SndX .bd bank>: its PS ADPCM through a second voice decodes to sound
+     * that is neither silent nor clipped. */
+    const char *bank=getenv("NGS2_TEST_VAG");
+    if (bank) {
+        FILE *f=fopen(bank,"rb");
+        static unsigned char vag[65536];
+        size_t n=f ? fread(vag,1,sizeof(vag),f) : 0;
+        if (f) fclose(f);
+        CHECK(n==sizeof(vag),"read %s",bank);
+        void *voice2; get_voice(samplers,1,&voice2);
+        begin();
+        { uint32_t *p=param(0x10000001,40); p[0]=0x1C; p[1]=1; p[2]=48000; }
+        Block vb={.offset=0,.size=(uint32_t)n,.repeats=0,.samples=0};
+        { unsigned char *p=param(0x10000002,32); const void *d=vag; const void *b=&vb;
+          memcpy(p,&d,8); uint32_t one=1; memcpy(p+12,&one,4); memcpy(p+16,&b,8); }
+        { uint32_t *p=param(5,24); p[0]=0; *(void **)(p+2)=mixer; }
+        { uint32_t *p=param(6,16); p[0]=0; }
+        control(voice2,list);
+        static float vout[(65536/16*28+2048)*2];
+        int total=(int)(n/16*28);
+        for (int at=0;at<total;at+=1024) {
+            int frames=total-at<1024 ? total-at : 1024;
+            RenderBuffer rb={vout+at*2,(uint64_t)frames*2*sizeof(float),0x18,2};
+            render(system,&rb,1);
+        }
+        double energy=0; int clipped=0, nans=0;
+        for (int i=0;i<total;++i) {
+            float x=vout[i*2];
+            if (x!=x) ++nans;
+            if (fabsf(x)>=0.999f) ++clipped;
+            energy+=(double)x*x;
+        }
+        double rms=sqrt(energy/total);
+        printf("VAG bank: %d samples, rms %.4f, %d clipped, %d NaN\n",total,rms,clipped,nans);
+        CHECK(nans==0 && rms>0.001 && clipped<total/100,"VAG decode looks wrong");
+    }
     printf("%s (%d failures)\n",failures ? "FAILED" : "ok",failures);
     return failures!=0;
 }
