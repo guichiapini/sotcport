@@ -243,6 +243,21 @@ struct PassInfo {
 
 namespace Shader::Optimization {
 
+/// bbport (sotc): a walk through tables the game has not filled yet (an area loading) leaves
+/// the walked part zero (null sharps) instead of patching the walker for good.
+[[gnu::noinline]] static void GuardedRefresh(Shader::Info& info) {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        const size_t direct = std::min(info.user_data.size(), info.flattened_ud_buf.size());
+        std::fill(info.flattened_ud_buf.begin() + direct, info.flattened_ud_buf.end(), 0u);
+        return;
+    }
+    runtime_fault_recover = &recover;
+    info.RefreshFlatBuf();
+    runtime_fault_recover = nullptr;
+}
+
 namespace {
 
 static inline u16 GetFlatbufOffset(const IR::Inst* inst) {
@@ -910,7 +925,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         SetFlatbufOffset(readconst, GetFlatbufOffset(original));
     }
 
-    program.info.RefreshFlatBuf();
+    GuardedRefresh(program.info);
 }
 
 } // namespace Shader::Optimization

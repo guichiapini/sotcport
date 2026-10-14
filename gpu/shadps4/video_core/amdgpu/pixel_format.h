@@ -171,7 +171,7 @@ private:
         case CompSwizzle::Alpha:
             return data[3];
         default:
-            UNREACHABLE();
+            return T{}; // bbport (sotc): reserved selector of a garbage sharp
         }
     }
 
@@ -356,7 +356,8 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // bbport (sotc): only garbage sharps (unread tables) pair these; no conversion.
+            return NumberConversion::None;
         }
     }
     default:

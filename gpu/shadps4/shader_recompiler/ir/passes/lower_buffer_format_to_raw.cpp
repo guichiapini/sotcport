@@ -26,6 +26,32 @@ static bool IsBufferFormatStore(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
 }
 
+/// bbport (sotc): sharps read through garbage resource tables (draws and dispatches issued
+/// while a level loads) carry formats the lowering cannot express; those read as zeros like a
+/// null sharp instead of ending the process.
+static bool IsLowerableFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    switch (data_format) {
+    case AmdGpu::DataFormat::Format8:
+    case AmdGpu::DataFormat::Format8_8:
+    case AmdGpu::DataFormat::Format8_8_8_8:
+    case AmdGpu::DataFormat::Format16:
+    case AmdGpu::DataFormat::Format16_16:
+    case AmdGpu::DataFormat::Format10_11_11:
+    case AmdGpu::DataFormat::Format2_10_10_10:
+    case AmdGpu::DataFormat::Format16_16_16_16:
+        return true;
+    case AmdGpu::DataFormat::Format32:
+    case AmdGpu::DataFormat::Format32_32:
+    case AmdGpu::DataFormat::Format32_32_32:
+    case AmdGpu::DataFormat::Format32_32_32_32:
+        return num_format == AmdGpu::NumberFormat::Uint ||
+               num_format == AmdGpu::NumberFormat::Sint ||
+               num_format == AmdGpu::NumberFormat::Float;
+    default:
+        return false;
+    }
+}
+
 static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
                                   const IR::BufferInstInfo info, const FormatInfo& format_info) {
     IR::Value interpreted;
@@ -212,7 +238,8 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         .num_components = AmdGpu::NumComponents(data_format),
     };
 
-    if (data_format == AmdGpu::DataFormat::FormatInvalid) {
+    if (data_format == AmdGpu::DataFormat::FormatInvalid ||
+        !IsLowerableFormat(data_format, format_info.num_format)) {
         LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(

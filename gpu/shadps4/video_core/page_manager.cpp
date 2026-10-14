@@ -101,6 +101,15 @@ struct PageManager::Impl {
     }
     virtual ~Impl() = default;
 
+    bool ReadWatched(VAddr addr) const {
+        const size_t page = addr >> PM_PAGE_BITS;
+        return page < NUM_ADDRESS_PAGES && cached_pages[page].num_read_watchers != 0;
+    }
+    bool WriteWatched(VAddr addr) const {
+        const size_t page = addr >> PM_PAGE_BITS;
+        return page < NUM_ADDRESS_PAGES && cached_pages[page].num_write_watchers != 0;
+    }
+
     /// bbport (sotc): after a fault was handled, the page must allow the access, else the
     /// faulting instruction runs into the same fault forever (a guest job thread spun in the
     /// exception dispatcher while the others waited on its lock). A read watch the buffer cache
@@ -149,12 +158,12 @@ struct PageManager::Impl {
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
             // bbport (sotc): a page denying reads holds GPU-written data: downloaded first.
-            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers) {
+            if (instance->ReadWatched(addr)) {
                 rasterizer->ReadMemory(addr, 8, is_gpu_thread);
             }
             const bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread);
-            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers ||
-                (!handled && instance->cached_pages[addr >> PM_PAGE_BITS].num_write_watchers)) {
+            if (instance->ReadWatched(addr) ||
+                (!handled && instance->WriteWatched(addr))) {
                 return instance->EnsureAccess(addr, true);
             }
             return handled;
@@ -168,7 +177,7 @@ struct PageManager::Impl {
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
             const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread);
-            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers) {
+            if (instance->ReadWatched(addr)) {
                 return instance->EnsureAccess(addr, false);
             }
             return handled;

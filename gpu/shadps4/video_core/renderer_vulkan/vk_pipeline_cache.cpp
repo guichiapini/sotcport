@@ -31,6 +31,37 @@
 
 namespace Vulkan {
 
+/// bbport (sotc): program registers pointing at no shader binary; the work is skipped.
+static void ReportMissingBinary(const u32* code) {
+    static std::atomic<u32> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::printf("Shader binary not found at %p: draw or dispatch skipped\n",
+                    static_cast<const void*>(code));
+    }
+}
+
+/// bbport (sotc): the resource table walk follows pointers from guest memory; one into memory
+/// that is not mapped (tables the game has not filled yet while an area loads) leaves the
+/// walked part zero: null sharps, instead of garbage ones or the walker patched for good.
+[[gnu::noinline]] static void GuardedRefreshFlatBuf(Shader::Info& info) {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        const size_t direct = std::min(info.user_data.size(), info.flattened_ud_buf.size());
+        std::fill(info.flattened_ud_buf.begin() + direct, info.flattened_ud_buf.end(), 0u);
+        static std::atomic<u32> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Shader %016llx: resource table walk faulted, tables read as zeros\n",
+                        static_cast<unsigned long long>(info.pgm_hash));
+        }
+        return;
+    }
+    runtime_fault_recover = &recover;
+    info.RefreshFlatBuf();
+    runtime_fault_recover = nullptr;
+}
+
+
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
@@ -400,7 +431,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         auto& info = const_cast<Program*>(stage.program)->info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
-        info.RefreshFlatBuf();
+        GuardedRefreshFlatBuf(info);
         if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size ||
             std::memcmp(info.flattened_ud_buf.data(), stage.flat,
                         stage.flat_size * sizeof(u32)) != 0) {
@@ -675,6 +706,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.fetch_shader = std::nullopt;
 
     Shader::Backend::Bindings binding{};
+    bool missing_binary = false;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -692,6 +724,13 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
+        if (params.code.empty()) {
+            ReportMissingBinary(pgm->Address<u32*>());
+            missing_binary = true;
+            key.stage_hashes[stage_out_idx] = 0;
+            sel.infos[stage_out_idx] = nullptr;
+            return false;
+        }
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
@@ -706,6 +745,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.modules.fill(nullptr);
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    if (missing_binary) {
+        return false;
+    }
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -790,13 +832,17 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
     }
 
-    return true;
+    return !missing_binary;
 }
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    if (cs_params.code.empty()) {
+        ReportMissingBinary(cs_pgm.Address<u32*>());
+        return false;
+    }
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -911,7 +957,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
-    info.RefreshFlatBuf();
+    GuardedRefreshFlatBuf(info);
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();

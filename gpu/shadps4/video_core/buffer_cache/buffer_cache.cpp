@@ -504,6 +504,30 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         .memoryTypeIndex = arena_memory_type_index,
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    // bbport (sotc): resident arena memory grows for good; reported per 256 MiB.
+    static u64 resident_total = 0;
+    const u64 before = resident_total >> 28;
+    resident_total += alloc_info.allocationSize;
+    if (alloc_info.allocationSize >= (64ull << 20)) {
+        void* frames[10]{};
+        const u16 n = CaptureStackBackTrace(1, 10, frames, nullptr);
+        std::string where;
+        for (u16 i = 0; i < n; ++i) {
+            HMODULE module{};
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(frames[i]), &module);
+            where += fmt::format(" @{:#x}", reinterpret_cast<uintptr_t>(frames[i]) -
+                                                reinterpret_cast<uintptr_t>(module));
+        }
+        std::printf("Buffer cache: %llu MiB made resident at %#llx:%s\n",
+                    (unsigned long long)(alloc_info.allocationSize >> 20),
+                    (unsigned long long)(first_block << block_shift), where.c_str());
+    }
+    if ((resident_total >> 28) != before) {
+        std::printf("Buffer cache: %llu MiB of guest memory resident in VRAM\n",
+                    (unsigned long long)(resident_total >> 20));
+    }
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =

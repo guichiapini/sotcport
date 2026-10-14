@@ -2247,7 +2247,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                // bbport (sotc): unbounded read-only buffers (num_records 0xffffffff) start at
+                // the game's per-frame heaps and reach the end of a 2-3 GiB mapping: binding
+                // all of it made that much guest memory resident in VRAM and uploaded it (out
+                // of device memory on 8 GB cards). The shaders index the first few MiB.
+                // BB_UNBOUNDED_CAP_MB=N (0: no cap).
+                static const u64 unbounded_cap = [] {
+                    const char* v = std::getenv("BB_UNBOUNDED_CAP_MB");
+                    return (v ? std::strtoull(v, nullptr, 10) : 64ull) << 20;
+                }();
+                if (unbounded_cap && vsharp.num_records == 0xffffffffu && !desc.is_written &&
+                    size > unbounded_cap) {
+                    size = unbounded_cap;
+                }
                 // bbport (sotc): CUSA08809 declares unbounded buffers (num_records ~4 GiB)
                 // thousands of times a second; the first few are enough.
                 static std::atomic<int> clamp_logs{0};
@@ -2306,6 +2319,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                     (unsigned long long)stage.pgm_hash,
                                     (unsigned long long)vsharp.base_address,
                                     (unsigned long long)size, binding.buffer);
+                    }
+                }
+                if (size >= (1024ull << 20)) {
+                    static std::atomic<u32> huge_shown{0};
+                    if (huge_shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        std::printf("Huge buffer: stage %#llx slot %u at %#llx size %llu "
+                                    "(records %u stride %u, written %d)\n",
+                                    (unsigned long long)stage.pgm_hash, binding.buffer,
+                                    (unsigned long long)vsharp.base_address,
+                                    (unsigned long long)size, vsharp.num_records,
+                                    u32(vsharp.stride), int(desc.is_written));
                     }
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(

@@ -74,7 +74,9 @@ std::string_view NameOf(DataFormat fmt) {
     case DataFormat::FormatBc7:
         return "FormatBc7";
     default:
-        UNREACHABLE();
+        // bbport (sotc): sharps read through garbage table pointers (never drawn with) name
+        // formats outside the enum; a log line must not end the process.
+        return "FormatUnknown";
     }
 }
 
@@ -107,7 +109,7 @@ std::string_view NameOf(NumberFormat fmt) {
     case NumberFormat::Ubscaled:
         return "Unscaled";
     default:
-        UNREACHABLE();
+        return "Unknown";
     }
 }
 

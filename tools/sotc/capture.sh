@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run CUSA08809 and dump the presented frame at the given seconds (default 15 30 45 60 90).
 # SOTC_PAD="40:cross 41: 50:down,cross 51:" holds the listed buttons from that second on
-# (comma-separated BB_PAD_FILE tokens; empty releases); "90:frame" records the frame analyzer
+# (comma-separated BB_PAD_FILE tokens; empty releases), "52:tap=down/down/cross" taps them
+# in turn; "90:frame" records the frame analyzer
 # (vk_frame_capture) at that second. Output: out/sotc-dump/<time>/ and
 # out/sotc-run.log. SOTC_TIMEOUT ends the run (default 100).
 set -uo pipefail
@@ -24,6 +25,10 @@ while IFS= read -r event; do
         : > "$trigger"
         # Desktop screenshots only on request: they capture whatever is on the screen.
         [[ ${SOTC_SCREENSHOT:-0} == 1 ]] && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/sotc/screenshot.ps1 "$(cygpath -w "$dump")/screen_$at.png" &
+    elif [[ $what == tap=* ]]; then
+        # tap=<buttons>[/<buttons>...]: each held ~0.15 s, then released for ~0.35 s.
+        IFS=/ read -ra taps <<< "${what#tap=}"
+        for t in "${taps[@]}"; do echo "${t//,/ }" > "$pad"; sleep 0.15; echo "" > "$pad"; sleep 0.35; done
     else echo "${what//,/ }" > "$pad"; fi
 done < <(printf '%s\n' "${events[@]}" | sort -t: -k1,1n)
 wait $game
