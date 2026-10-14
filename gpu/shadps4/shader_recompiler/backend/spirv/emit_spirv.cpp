@@ -151,8 +151,14 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+// bbport (sotc): loop back edges an invocation may take before every loop exits. Translated
+// loops whose exit depends on data the port gets wrong otherwise spin until the driver resets
+// the device; real shaders stay far below this.
+constexpr u32 MaxLoopIterations = 1u << 16;
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    Id loop_counter{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -162,6 +168,11 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!Sirit::ValidId(loop_counter)) {
+                // Function variables go first in the entry block.
+                loop_counter = ctx.DefineVar<false>(ctx.U32[1], spv::StorageClass::Function,
+                                                    ctx.u32_zero_value);
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
@@ -197,6 +208,12 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            const Id taken{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], loop_counter),
+                                      ctx.ConstU32(1u))};
+            ctx.OpStore(loop_counter, taken);
+            cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                    ctx.OpULessThan(ctx.U1[1], taken,
+                                                    ctx.ConstU32(MaxLoopIterations)));
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);

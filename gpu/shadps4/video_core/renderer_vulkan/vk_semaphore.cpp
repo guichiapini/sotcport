@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -8,8 +9,6 @@
 #include "common/assert.h"
 
 namespace Vulkan {
-
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -62,7 +61,20 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    // bbport (sotc): a wait that lasts seconds is reported (hang diagnosis).
+    u32 stalls = 0;
+    vk::Result result;
+    while ((result = instance.GetDevice().waitSemaphores(&wait_info, 3'000'000'000ull)) !=
+           vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceLost();
+            ASSERT_MSG(false, "Device lost while waiting for tick {}", tick);
+        }
+        auto [res, counter] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
+        std::printf("Semaphore stall #%u: waiting tick %llu, gpu counter %llu, next %llu\n",
+                    ++stalls, (unsigned long long)tick, (unsigned long long)counter,
+                    (unsigned long long)CurrentTick());
+        std::fflush(stdout);
     }
     Refresh();
 }

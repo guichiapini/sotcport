@@ -86,6 +86,10 @@ def main():
     # value keeps its own GPU folder.
     env.setdefault('BB_DIRECT_MEMORY_ACCESS', '1')
     env.setdefault('BB_GPU_USER_DIR', str(user / f"gpu-dma{env['BB_DIRECT_MEMORY_ACCESS']}"))
+    # The game decides on the CPU which scenery to draw from results its compute shaders
+    # wrote (visibility): without precise readbacks the CPU sees stale memory and the main
+    # view loses all terrain while the shadow maps keep it.
+    env.setdefault('BB_READBACKS', '2')
     env.setdefault('BB_VBLANK_HZ', '60')
     env.setdefault('BB_HEARTBEAT', '10')
     # Guest memory copies run on the GPU command thread, the one thread whose protection

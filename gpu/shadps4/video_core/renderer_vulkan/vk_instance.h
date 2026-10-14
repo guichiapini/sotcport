@@ -27,6 +27,9 @@ void NoteOverBudget(const char* what);
 class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
+
+    /// bbport (sotc): prints what VK_EXT_device_fault reports after a device loss.
+    void ReportDeviceLost() const;
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     /// Headless logical device for renderer regression tests (no window or game).
@@ -571,6 +574,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool device_fault{};
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};

@@ -23,6 +23,20 @@
 
 namespace VideoCore {
 
+/// bbport (sotc): hash of guest memory that may not be mapped (a texture the game points at
+/// memory it only reserved): a fault yields a hash that never matches instead of a crash.
+[[gnu::noinline]] static u64 GuardedHash(const u8* data, u64 size) {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        return ~0ull;
+    }
+    runtime_fault_recover = &recover;
+    const u64 hash = XXH3_64bits(data, size);
+    runtime_fault_recover = nullptr;
+    return hash;
+}
+
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
@@ -821,7 +835,7 @@ void TextureCache::RefreshImage(Image& image) {
                            image.usage.depth_target;
         if (track) {
             const u8* mip_addr = std::bit_cast<u8*>(image.info.guest_address) + mip_offset;
-            const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
+            const u64 mip_hash = GuardedHash(mip_addr, mip_size);
             if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
                 continue;
             }

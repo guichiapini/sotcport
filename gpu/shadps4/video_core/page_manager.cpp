@@ -94,8 +94,40 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    inline static Impl* instance;
+
+    Impl() {
+        instance = this;
+    }
     virtual ~Impl() = default;
+
+    /// bbport (sotc): after a fault was handled, the page must allow the access, else the
+    /// faulting instruction runs into the same fault forever (a guest job thread spun in the
+    /// exception dispatcher while the others waited on its lock). A read watch the buffer cache
+    /// did not lift (no GPU-written data left behind it, or memory the GPU never mapped) is
+    /// overridden in the protection only: its count stays for the matching unwatch.
+    bool EnsureAccess(VAddr addr, bool write) {
+        const size_t page = addr >> PM_PAGE_BITS;
+        if (page >= NUM_ADDRESS_PAGES) {
+            return false;
+        }
+        Common::RangeLockGuard lk(locks.begin() + page / PAGES_PER_LOCK,
+                                  locks.begin() + page / PAGES_PER_LOCK + 1);
+        const PageState& state = cached_pages[page];
+        if (state.num_read_watchers == 0 && (!write || state.num_write_watchers == 0)) {
+            return true;
+        }
+        static std::atomic<u32> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::printf("Fault %#llx (%s): read watch kept, overriding protection\n",
+                        (unsigned long long)addr, write ? "write" : "read");
+            std::fflush(stdout);
+        }
+        Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE,
+                write ? Core::MemoryPermission::ReadWrite
+                      : Core::MemoryPermission::Read | state.WritePerm());
+        return true;
+    }
 
     virtual void OnMap(VAddr address, size_t size) {
         // No-op
@@ -116,11 +148,30 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
-            return rasterizer->OnWriteFault(addr, is_gpu_thread);
+            // bbport (sotc): a page denying reads holds GPU-written data: downloaded first.
+            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers) {
+                rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            }
+            const bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread);
+            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers ||
+                (!handled && instance->cached_pages[addr >> PM_PAGE_BITS].num_write_watchers)) {
+                return instance->EnsureAccess(addr, true);
+            }
+            return handled;
         } else {
+            // bbport (sotc): a speculative read (draw preparation workers, holding the program
+            // cache lock the GPU thread may wait for) gives up instead of waiting for the GPU
+            // thread to download the page: the fault recovery returns to its caller.
+            if (runtime_fault_recover && !is_gpu_thread) {
+                return false;
+            }
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
-            return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            if (instance->cached_pages[addr >> PM_PAGE_BITS].num_read_watchers) {
+                return instance->EnsureAccess(addr, false);
+            }
+            return handled;
         }
         return false;
     }
@@ -424,8 +475,11 @@ struct SignalImpl : public PageManager::Impl {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
+        // bbport (sotc): reads denied (GPU-written data, precise readbacks) with writes allowed
+        // has no x86 equivalent: both fault, and the write fault downloads the data first.
+        if (perms == Core::MemoryPermission::Write) {
+            perms = Core::MemoryPermission::None;
+        }
         impl.Protect(address, size, perms);
     }
 

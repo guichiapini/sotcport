@@ -31,6 +31,28 @@
 
 namespace Vulkan {
 
+/// bbport (sotc): frame analyzer line for a draw: shaders, size and the fixed-function state
+/// that decides whether it reaches the targets.
+static std::string DescribeDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                                const char* kind, u32 count, u32 instances) {
+    const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto& dc = regs.depth_control;
+    const auto& vp = regs.viewports[0];
+    const auto& cc = regs.clipper_control;
+    return fmt::format(
+        "{} vs {:08x} ps {:08x} n {} inst {} | z en{} wr{} func{} bounds{} [{:g},{:g}] st{} | "
+        "cull {} | vp x {:g}+{:g} y {:g}+{:g} z {:g}+{:g} depth [{:g},{:g}] | clip dis{} "
+        "space{} zn{} zf{} | mask {:#x}",
+        kind, u32(vs ? vs->pgm_hash : 0), u32(ps ? ps->pgm_hash : 0), count, instances,
+        u32(dc.depth_enable), u32(dc.depth_write_enable), u32(dc.depth_func),
+        u32(dc.depth_bounds_enable), regs.depth_bounds_min, regs.depth_bounds_max,
+        u32(dc.stencil_enable), u32(regs.polygon_control.CullingMode()), vp.xscale, vp.xoffset,
+        vp.yscale, vp.yoffset, vp.zscale, vp.zoffset, regs.viewport_depths[0].zmin,
+        regs.viewport_depths[0].zmax, u32(cc.clip_disable), u32(cc.clip_space),
+        u32(cc.zclip_near_disable), u32(cc.zclip_far_disable), regs.color_target_mask.raw);
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -1137,6 +1159,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
+        FrameCapture::DrawDetail(DescribeDraw(regs, pipeline, is_indexed ? "idx" : "arr",
+                                              num_indices, num_instances));
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -1242,7 +1266,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     static std::atomic<u32> probe_draws{0};
     if (probe_every && probe_draws.fetch_add(1, std::memory_order_relaxed) % probe_every == 0) {
         const VkBufferCreateInfo probe_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                          .size = 32,
+                                          .size = 4096,
                                           .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         const VmaAllocationCreateInfo probe_alloc{
             .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
@@ -1252,7 +1276,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         VmaAllocationInfo probe_info{};
         if (vmaCreateBuffer(instance.GetAllocator(), &probe_ci, &probe_alloc, &probe, &probe_memory,
                             &probe_info) == VK_SUCCESS) {
-            std::memset(probe_info.pMappedData, 0xff, 32);
+            std::memset(probe_info.pMappedData, 0xff, 4096);
+            const u32 probe_records = std::min<u32>(max_count, (4096 - 16) / stride);
             scheduler.EndRendering();
             const vk::Buffer args_handle = buffer->Handle();
             const vk::Buffer count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{};
@@ -1264,20 +1289,36 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                     .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
                     .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
                 cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
-                cmdbuf.copyBuffer(args_handle, probe, vk::BufferCopy{args_at, 0, 20});
+                cmdbuf.copyBuffer(args_handle, probe,
+                                  vk::BufferCopy{args_at, 16, u64(probe_records) * stride});
                 if (count_handle) {
-                    cmdbuf.copyBuffer(count_handle, probe, vk::BufferCopy{count_at, 20, 4});
+                    cmdbuf.copyBuffer(count_handle, probe, vk::BufferCopy{count_at, 0, 4});
                 }
             });
             const VAddr args_address = indirect.args;
+            const u32 reg_indices = Regs().num_indices;
             scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), probe,
-                                              probe_memory, probe_info, max_count, args_address,
+                                              probe_memory, probe_info, max_count, args_address, reg_indices,
+                                              probe_records, stride,
                                               vs = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash] {
                 vmaInvalidateAllocation(allocator, probe_memory, 0, VK_WHOLE_SIZE);
                 const auto* v = static_cast<const u32*>(probe_info.pMappedData);
-                std::printf("Indirect: vs %08llx args %#llx max %u count %d first {%u %u %u %d %u}\n",
+                // v[0]: draw count (0xffffffff without a count buffer); records from v[4].
+                const u32 count = v[0] == 0xffffffffu ? max_count : std::min(v[0], max_count);
+                u64 max_elems = 0, max_inst = 0, total = 0;
+                const u32* rec = v + 4;
+                for (u32 i = 0; i < std::min(count, probe_records); ++i, rec += stride / 4) {
+                    max_elems = std::max<u64>(max_elems, rec[0]);
+                    max_inst = std::max<u64>(max_inst, rec[1]);
+                    total += u64(rec[0]) * rec[1];
+                }
+                const u32* first = v + 4;
+                std::printf("Indirect: vs %08llx args %#llx max %u count %d regidx %u first {%u %u %u "
+                            "%d %u} max_elems %llu max_inst %llu total %llu\n",
                             (unsigned long long)vs, (unsigned long long)args_address, max_count,
-                            int(v[5]), v[0], v[1], v[2], int(v[3]), v[4]);
+                            int(v[0]), reg_indices, first[0], first[1], first[2], int(first[3]),
+                            first[4], (unsigned long long)max_elems, (unsigned long long)max_inst,
+                            (unsigned long long)total);
                 vmaDestroyBuffer(allocator, probe, probe_memory);
             });
         }
@@ -1306,6 +1347,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    if (FrameCapture::Active()) {
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        FrameCapture::Draw(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0, 0, 0);
+        FrameCapture::DrawDetail(DescribeDraw(Regs(), pipeline,
+                                              count_address ? "indirect-count" : "indirect",
+                                              max_count, 0));
+    }
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -3295,8 +3344,17 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     DrainDrawPipe();
-    if (!IsMapped(addr, size)) {
+    // bbport (sotc): pages the tracker protected although the game never mapped them for the
+    // GPU ("not fully GPU mapped") hold GPU-written data all the same.
+    if (!IsMapped(addr, size) && !buffer_cache.IsRegionGpuModified(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
+        static std::atomic<u32> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::printf("ReadMemory: %#llx not GPU mapped, mapped(page) %d cpu-modified %d\n",
+                        (unsigned long long)addr, int(IsMapped(addr & ~0xfffull, 0x1000)),
+                        int(buffer_cache.IsRegionCpuModified(addr, size)));
+            std::fflush(stdout);
+        }
         return false;
     }
     buffer_cache.ReadMemory(addr, size, false, assume_locks);

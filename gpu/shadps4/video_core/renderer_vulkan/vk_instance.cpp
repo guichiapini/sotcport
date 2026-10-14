@@ -385,6 +385,8 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
+    // bbport (sotc): on device loss, the fault address the driver reports (ReportDeviceLost).
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -586,6 +588,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -642,6 +647,9 @@ bool Instance::CreateDevice() {
     }
     if (!mixed_float_dot_product) {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+    }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
@@ -912,6 +920,38 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+void Instance::ReportDeviceLost() const {
+    if (!device_fault) {
+        std::printf("Device lost (VK_EXT_device_fault unavailable)\n");
+        return;
+    }
+    const auto get_info = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (!get_info || get_info(*device, &counts, nullptr) < 0) {
+        std::printf("Device lost: no fault information\n");
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+                              .pAddressInfos = addresses.data(),
+                              .pVendorInfos = vendor.data()};
+    counts.vendorBinarySize = 0;
+    get_info(*device, &counts, &info);
+    std::printf("Device lost: %s (%u addresses, %u vendor records)\n", info.description,
+                counts.addressInfoCount, counts.vendorInfoCount);
+    for (const auto& a : addresses) {
+        std::printf("  fault address type %d: %#llx (precision %#llx)\n", int(a.addressType),
+                    (unsigned long long)a.reportedAddress,
+                    (unsigned long long)a.addressPrecision);
+    }
+    for (const auto& v : vendor) {
+        std::printf("  vendor: %s code %#llx data %#llx\n", v.description,
+                    (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
+    }
+    std::fflush(stdout);
 }
 
 } // namespace Vulkan

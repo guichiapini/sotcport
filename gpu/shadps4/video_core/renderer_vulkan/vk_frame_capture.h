@@ -44,6 +44,8 @@ public:
     /// Contents of a bound buffer (first 1 KiB), kept for small passes and a pass's first draw.
     static void Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size);
     static void Note(const char* text);
+    /// One line describing a draw of the current pass (the first few dozen per pass).
+    static void DrawDetail(const std::string& line);
 
 private:
     enum : u32 { Idle, Armed, Recording };

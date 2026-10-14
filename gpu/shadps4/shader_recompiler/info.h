@@ -244,6 +244,21 @@ struct Info : InfoPersistent {
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
+        // bbport (sotc): BB_FLAT_DUMP=<hex hash>: that shader's flattened user data, now and then.
+        static const u64 flat_dump = [] {
+            const char* v = std::getenv("BB_FLAT_DUMP");
+            return v ? std::strtoull(v, nullptr, 16) : 0ull;
+        }();
+        static u32 flat_calls = 0;
+        if (flat_dump && pgm_hash == flat_dump && flat_calls++ % 3000 == 0) {
+            std::string line;
+            for (size_t i = 0; i < flattened_ud_buf.size() && i < 64; ++i) {
+                float f;
+                std::memcpy(&f, &flattened_ud_buf[i], 4);
+                line += fmt::format(" {}:{:g}", i, f);
+            }
+            std::printf("Flat %016llx:%s\n", (unsigned long long)pgm_hash, line.c_str());
+        }
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {

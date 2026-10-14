@@ -32,6 +32,7 @@ struct Entry {
     std::vector<std::pair<Target, bool>> sampled; ///< textures (false) and storage images (true)
     std::string note;
     std::vector<std::string> buffers; ///< dumped constants, per draw
+    std::vector<std::string> details; ///< per-draw state lines
 };
 
 // GPU thread only.
@@ -116,6 +117,9 @@ void Write(VAddr presented) {
         }
         if (!e.note.empty()) {
             std::fprintf(f, "  note: %s\n", e.note.c_str());
+        }
+        for (const auto& d : e.details) {
+            std::fprintf(f, "  draw %s\n", d.c_str());
         }
         for (const auto& b : e.buffers) {
             std::fprintf(f, "%s\n", b.c_str());
@@ -262,6 +266,14 @@ void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {
     if (pending_sampled.size() < 64) {
         pending_sampled.emplace_back(ToTarget(info), storage);
     }
+}
+
+void FrameCapture::DrawDetail(const std::string& line) {
+    if (state.load(std::memory_order_relaxed) != Recording || entries.empty() ||
+        entries.back().compute || entries.back().details.size() >= 96) {
+        return;
+    }
+    entries.back().details.push_back(line);
 }
 
 void FrameCapture::Note(const char* text) {
