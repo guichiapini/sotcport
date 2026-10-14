@@ -1,9 +1,8 @@
-/* libSceNgs2 and libSceAudio3d for CUSA08809, first stage: the API contracts and real-time
- * pacing, without sound. Ngs2 systems, racks and voices are host objects; rendering fills
- * the game's buffers with silence and voices report idle. Audio3d ports keep a virtual
- * output queue that drains at 48 kHz, so a synchronous sceAudio3dPortPush blocks as long
- * as the hardware would (the game paces its audio thread on it). Object PCM is accepted and
- * dropped. Mixing into AudioOut is the next stage. */
+/* libSceAudio3d for CUSA08809: the API contracts and real-time pacing, without sound (the
+ * game initializes it only in some modes; its sound goes through Ngs2, runtime_sotc_ngs2.c).
+ * Ports keep a virtual output queue that drains at 48 kHz, so a synchronous
+ * sceAudio3dPortPush blocks as long as the hardware would. Object PCM is accepted and
+ * dropped. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <pthread.h>
@@ -12,109 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-/* ---------------- Ngs2 ---------------- */
-#define NGS2_ERR_INVALID_HANDLE ((int32_t)0x804A0230)
-#define NGS2_ERR_INVALID_OUT_ADDRESS ((int32_t)0x804A0053)
-#define NGS2_ERR_INVALID_BUFFER_INFO ((int32_t)0x804A0054)
-#define NGS2_ERR_INVALID_VOICE_INDEX ((int32_t)0x804A0303)
-#define NGS2_RACK_VOICES 256
-enum { HANDLE_SYSTEM=1, HANDLE_RACK=2, HANDLE_VOICE=3 };
-typedef struct { void *buffer; uint64_t size; uint32_t waveform_type, channels; } RenderBufferInfo;
-typedef struct { void *host_buffer; uint64_t host_size; uintptr_t reserved[5]; uintptr_t user_data; } ContextBufferInfo;
-typedef struct { uint64_t size; char name[16]; uint32_t flags, max_grain_samples, max_voices; } RackOption;
-typedef struct Ngs2Handle {
-    uint32_t magic, type;
-    struct Ngs2Handle *owner;
-    uint32_t rack_id, index, voices;
-    struct Ngs2Handle *voice;     /* racks: their voices */
-} Ngs2Handle;
-#define NGS2_MAGIC UINT32_C(0x4e475332)
-static atomic_size_t ngs2_renders;
-static int ngs2_valid(const Ngs2Handle *h, uint32_t type) { return h && h->magic==NGS2_MAGIC && h->type==type; }
-static Ngs2Handle *ngs2_new(uint32_t type, Ngs2Handle *owner) {
-    Ngs2Handle *h=calloc(1,sizeof(*h));
-    if (h) { h->magic=NGS2_MAGIC; h->type=type; h->owner=owner; }
-    return h;
-}
-static ABI int32_t ngs2_system_create(const void *option, const void *allocator, Ngs2Handle **out) {
-    (void)option; (void)allocator;
-    if (!out) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    *out=ngs2_new(HANDLE_SYSTEM,NULL);
-    printf("Runtime: Ngs2 system created (silent renderer)\n");
-    return 0;
-}
-static ABI int32_t ngs2_system_destroy(Ngs2Handle *h, ContextBufferInfo *out) {
-    if (!ngs2_valid(h,HANDLE_SYSTEM)) return NGS2_ERR_INVALID_HANDLE;
-    if (out) memset(out,0,sizeof(*out));
-    h->magic=0; free(h); return 0;
-}
-static ABI int32_t ngs2_system_render(Ngs2Handle *h, const RenderBufferInfo *buffers, uint32_t count) {
-    if (!ngs2_valid(h,HANDLE_SYSTEM)) return NGS2_ERR_INVALID_HANDLE;
-    if (!buffers && count) return NGS2_ERR_INVALID_BUFFER_INFO;
-    for (uint32_t i=0;i<count;++i) if (buffers[i].buffer) memset(buffers[i].buffer,0,buffers[i].size);
-    atomic_fetch_add(&ngs2_renders,1);
-    return 0;
-}
-static ABI int32_t ngs2_rack_query(uint32_t rack_id, const RackOption *option, ContextBufferInfo *out) {
-    (void)rack_id; (void)option;
-    if (!out) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    memset(out,0,sizeof(*out)); out->host_size=4096;
-    return 0;
-}
-static int32_t rack_create(Ngs2Handle *system, uint32_t rack_id, const RackOption *option, Ngs2Handle **out) {
-    if (!ngs2_valid(system,HANDLE_SYSTEM)) return NGS2_ERR_INVALID_HANDLE;
-    if (!out) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    uint32_t voices=option && option->size>=offsetof(RackOption,max_voices)+4 && option->max_voices ? option->max_voices : NGS2_RACK_VOICES;
-    Ngs2Handle *rack=ngs2_new(HANDLE_RACK,system);
-    if (!rack) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    rack->rack_id=rack_id; rack->voices=voices; rack->voice=calloc(voices,sizeof(Ngs2Handle));
-    for (uint32_t i=0;i<voices;++i) rack->voice[i]=(Ngs2Handle){NGS2_MAGIC,HANDLE_VOICE,rack,rack_id,i,0,NULL};
-    *out=rack; return 0;
-}
-static ABI int32_t ngs2_rack_create(Ngs2Handle *system, uint32_t rack_id, const RackOption *option,
-                                    const ContextBufferInfo *buffer, Ngs2Handle **out) {
-    (void)buffer; return rack_create(system,rack_id,option,out);
-}
-static ABI int32_t ngs2_rack_create_alloc(Ngs2Handle *system, uint32_t rack_id, const RackOption *option,
-                                          const void *allocator, Ngs2Handle **out) {
-    (void)allocator; return rack_create(system,rack_id,option,out);
-}
-static ABI int32_t ngs2_rack_destroy(Ngs2Handle *rack, ContextBufferInfo *out) {
-    if (!ngs2_valid(rack,HANDLE_RACK)) return NGS2_ERR_INVALID_HANDLE;
-    if (out) memset(out,0,sizeof(*out));
-    rack->magic=0; /* voice handles may still be queried by late callers: kept */
-    return 0;
-}
-static ABI int32_t ngs2_rack_voice(Ngs2Handle *rack, uint32_t index, Ngs2Handle **out) {
-    if (!ngs2_valid(rack,HANDLE_RACK)) return NGS2_ERR_INVALID_HANDLE;
-    if (!out) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    if (index>=rack->voices) return NGS2_ERR_INVALID_VOICE_INDEX;
-    *out=&rack->voice[index]; return 0;
-}
-static ABI int32_t ngs2_voice_control(Ngs2Handle *voice, const void *params) {
-    (void)params;
-    return ngs2_valid(voice,HANDLE_VOICE) ? 0 : NGS2_ERR_INVALID_HANDLE;
-}
-static ABI int32_t ngs2_voice_state(Ngs2Handle *voice, void *state, uint64_t size) {
-    if (!ngs2_valid(voice,HANDLE_VOICE)) return NGS2_ERR_INVALID_HANDLE;
-    if (!state) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    memset(state,0,size); return 0;  /* flags 0: not in use, nothing playing */
-}
-static ABI int32_t ngs2_voice_flags(Ngs2Handle *voice, uint32_t *flags) {
-    if (!ngs2_valid(voice,HANDLE_VOICE)) return NGS2_ERR_INVALID_HANDLE;
-    if (!flags) return NGS2_ERR_INVALID_OUT_ADDRESS;
-    *flags=0; return 0;
-}
-static const RuntimeExport ngs2_exports[]={
-    {"sceNgs2SystemCreateWithAllocator",ngs2_system_create}, {"sceNgs2SystemDestroy",ngs2_system_destroy},
-    {"sceNgs2SystemRender",ngs2_system_render}, {"sceNgs2RackQueryBufferSize",ngs2_rack_query},
-    {"sceNgs2RackCreate",ngs2_rack_create}, {"sceNgs2RackCreateWithAllocator",ngs2_rack_create_alloc},
-    {"sceNgs2RackDestroy",ngs2_rack_destroy}, {"sceNgs2RackGetVoiceHandle",ngs2_rack_voice},
-    {"sceNgs2VoiceControl",ngs2_voice_control}, {"sceNgs2VoiceGetState",ngs2_voice_state},
-    {"sceNgs2VoiceGetStateFlags",ngs2_voice_flags},
-};
-uintptr_t runtime_ngs2_resolve(const char *name) { return RUNTIME_LOOKUP(ngs2_exports,name); }
 
 /* ---------------- Audio3d ---------------- */
 #define A3D_ERR_INVALID_PORT ((int32_t)0x80EA0002)
@@ -276,6 +172,7 @@ static const RuntimeExport a3d_exports[]={
     {"sceAudio3dPortGetQueueLevel",a3d_queue_level},
 };
 uintptr_t runtime_audio3d_resolve(const char *name) { return RUNTIME_LOOKUP(a3d_exports,name); }
+size_t runtime_ngs2_renders(void);
 void runtime_sotc_audio_report(void) {
-    printf("Runtime: Ngs2 renders=%zu, Audio3d pushes=%zu\n",atomic_load(&ngs2_renders),atomic_load(&a3d_pushes));
+    printf("Runtime: Ngs2 renders=%zu, Audio3d pushes=%zu\n",runtime_ngs2_renders(),atomic_load(&a3d_pushes));
 }
