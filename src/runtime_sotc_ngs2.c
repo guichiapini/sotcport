@@ -482,6 +482,12 @@ static void block_end(Ngs2Handle *voice) {
     }
     v->byte_pos=0; v->sample_pos=0; v->decoded_count=v->decoded_pos=0;
     memset(v->vag_hist,0,sizeof(v->vag_hist));
+    /* A block whose sample count ends inside a superframe leaves the decoder expecting the
+     * rest of it; the next block starts a new superframe (SUPERFRAME_FLAG_INVALID: the music
+     * stopped at its first stream block change). */
+    if (v->at9 && v->at9_frame_in_superframe) {
+        unsigned char config[4]; at9_config(v,config); Atrac9InitDecoder(v->at9,config);
+    }
     v->at9_frame_in_superframe=0;
     if (v->current>=v->blocks) v->state=(v->state&~(uint32_t)ST_PLAYING)|ST_STOPPED|ST_EMPTY;
 }
