@@ -359,7 +359,10 @@ static void *heartbeat(void *argument) {
     }
     return NULL;
 }
+void probe_start_profile(void);
 void runtime_sotc_start(void) {
+    static atomic_int profiling;
+    if (!atomic_exchange(&profiling,1)) probe_start_profile();
     static atomic_int started;
     const char *v=getenv("BB_HEARTBEAT");
     if (!v || atoi(v)<=0 || atomic_exchange(&started,1)) return;

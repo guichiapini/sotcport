@@ -246,6 +246,102 @@ void probe_dump_threads(void) {
     }
     CloseHandle(snapshot);
 }
+/* BB_PROFILE=<start s>:<seconds>[:<thread name parts, comma-separated>]: a sampling profile of
+ * the named threads (default bb:DrawRec and the GPU command thread), every ~1 ms, printed as
+ * "Profile" lines (self and inclusive sample counts per code address; tools/sotc/prof_report.py
+ * names them). */
+typedef struct { uintptr_t address; unsigned self, total; } ProfileSlot;
+#define PROFILE_SLOTS 65536
+static ProfileSlot *profile_slot(ProfileSlot *table, uintptr_t address) {
+    size_t i=(size_t)((address*0x9E3779B97F4A7C15ull)>>48)&(PROFILE_SLOTS-1);
+    for (size_t n=0;n<PROFILE_SLOTS;++n,i=(i+1)&(PROFILE_SLOTS-1)) {
+        if (table[i].address==address) return &table[i];
+        if (!table[i].address) { table[i].address=address; return &table[i]; }
+    }
+    return NULL;
+}
+static int profile_compare_self(const void *a, const void *b) {
+    return (int)((const ProfileSlot *)b)->self-(int)((const ProfileSlot *)a)->self;
+}
+static int profile_compare_total(const void *a, const void *b) {
+    return (int)((const ProfileSlot *)b)->total-(int)((const ProfileSlot *)a)->total;
+}
+static DWORD WINAPI profile_thread(LPVOID unused) {
+    (void)unused;
+    const char *spec=getenv("BB_PROFILE");
+    double start=atof(spec), duration=10;
+    const char *colon=strchr(spec,':');
+    if (colon) duration=atof(colon+1);
+    char filter[256]="bb:DrawRec,GpuCommandProcessor";
+    if (colon && (colon=strchr(colon+1,':'))) snprintf(filter,sizeof(filter),"%s",colon+1);
+    Sleep((DWORD)(start*1000));
+    /* The threads to sample, found by name once. */
+    HANDLE threads[16]; char names[16][64]; int count=0;
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 entry={.dwSize=sizeof(entry)};
+    for (BOOL more=Thread32First(snapshot,&entry); more && count<16; more=Thread32Next(snapshot,&entry)) {
+        if (entry.th32OwnerProcessID!=GetCurrentProcessId()) continue;
+        HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
+        if (!thread) continue;
+        char name[64]=""; PWSTR wide=NULL;
+        if (SUCCEEDED(GetThreadDescription(thread,&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        int match=0;
+        char parts[256]; snprintf(parts,sizeof(parts),"%s",filter);
+        for (char *p=strtok(parts,","); p; p=strtok(NULL,",")) if (*name && strstr(name,p)) match=1;
+        if (match) { threads[count]=thread; snprintf(names[count],64,"%s",name); ++count; }
+        else CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+    ProfileSlot *tables=calloc((size_t)count*PROFILE_SLOTS,sizeof(ProfileSlot));
+    unsigned samples[16]={0};
+    const ULONGLONG end=GetTickCount64()+(ULONGLONG)(duration*1000);
+    while (GetTickCount64()<end) {
+        for (int t=0;t<count;++t) {
+            uintptr_t frames[24]; int n=0;
+            CONTEXT c={.ContextFlags=CONTEXT_FULL};
+            if (SuspendThread(threads[t])==(DWORD)-1) continue;
+            if (GetThreadContext(threads[t],&c)) n=unwind_frames(&c,frames,24);
+            ResumeThread(threads[t]);
+            if (!n) continue;
+            ++samples[t];
+            ProfileSlot *table=tables+(size_t)t*PROFILE_SLOTS;
+            ProfileSlot *s=profile_slot(table,frames[0]);
+            if (s) ++s->self;
+            for (int i=0;i<n;++i) {
+                int seen=0;
+                for (int j=0;j<i;++j) if (frames[j]==frames[i]) seen=1;
+                if (seen) continue;
+                if ((s=profile_slot(table,frames[i]))) ++s->total;
+            }
+        }
+        Sleep(1);
+    }
+    for (int t=0;t<count;++t) {
+        ProfileSlot *table=tables+(size_t)t*PROFILE_SLOTS;
+        char where[MAX_PATH+64];
+        fprintf(stderr,"Profile thread '%s': %u samples\n",names[t],samples[t]);
+        qsort(table,PROFILE_SLOTS,sizeof(*table),profile_compare_self);
+        for (int i=0;i<40 && table[i].self;++i) {
+            describe_address(where,sizeof(where),table[i].address);
+            fprintf(stderr,"Profile self %5.1f%% %s\n",100.0*table[i].self/samples[t],where);
+        }
+        qsort(table,PROFILE_SLOTS,sizeof(*table),profile_compare_total);
+        for (int i=0;i<60 && table[i].total;++i) {
+            describe_address(where,sizeof(where),table[i].address);
+            fprintf(stderr,"Profile total %5.1f%% %s\n",100.0*table[i].total/samples[t],where);
+        }
+        CloseHandle(threads[t]);
+    }
+    fflush(stderr);
+    free(tables);
+    return 0;
+}
+void probe_start_profile(void) {
+    if (getenv("BB_PROFILE")) CloseHandle(CreateThread(NULL,0,profile_thread,NULL,0,NULL));
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
