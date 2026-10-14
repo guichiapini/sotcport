@@ -240,6 +240,33 @@ struct PageManager::Impl {
             BbStats::Timer timer{BbStats::t_read_faults};
             bool not_written = false;
             const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread, &not_written);
+#ifdef _WIN32
+            // bbport (sotc): BB_READ_FAULT_STATS=3: where reads that needed a download came
+            // from (the faulting code and its callers, unwound from the fault's context).
+            static const bool where = [] {
+                const char* v = std::getenv("BB_READ_FAULT_STATS");
+                return v && v[0] == '3';
+            }();
+            static std::atomic<u32> where_shown{0};
+            if (where && !not_written && where_shown.fetch_add(1) < 300) {
+                CONTEXT c = *static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+                std::string line = fmt::format("Readback at {:#x} ({}):", addr, is_gpu_thread ? "GPU" : "guest");
+                for (int depth = 0; depth < 10 && c.Rip; ++depth) {
+                    HMODULE module{};
+                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(c.Rip), &module);
+                    line += fmt::format(" {}{:#x}", module == GetModuleHandleA(nullptr) ? "@" : "?",
+                                        c.Rip - reinterpret_cast<DWORD64>(module));
+                    DWORD64 base = 0;
+                    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+                    if (!function) break;
+                    void* handler; DWORD64 frame;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, function, &c, &handler, &frame, nullptr);
+                }
+                std::puts(line.c_str());
+            }
+#endif
             if (not_written && instance->ReadWatched(addr) &&
                 instance->StepOverRead(context, addr)) {
                 return true;
