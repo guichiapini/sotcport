@@ -71,21 +71,21 @@ int main(void) {
     static int16_t pcm[N];
     for (int i=0;i<N;++i) pcm[i]=(int16_t)lrint(16384.0*sin(2*M_PI*1000.0*i/48000.0));
 
-    begin(); { uint32_t *p=param(0x30000001,16); p[0]=2; }          /* mastering setup: 2 ch */
+    begin(); { uint32_t *p=param(0x30000000,16); p[0]=2; }          /* mastering setup: 2 ch */
     { uint32_t *p=param(6,16); p[0]=0; }                              /* play */
     CHECK(control(master,list)==0,"mastering control");
-    begin(); { uint32_t *p=param(0x20000001,16); p[0]=2; }          /* submixer setup: 2 ch */
+    begin(); { uint32_t *p=param(0x20000000,16); p[0]=2; }          /* submixer setup: 2 ch */
     { uint32_t *p=param(5,24); p[0]=0; p[1]=0; *(void **)(p+2)=master; }   /* port 0 -> master */
     { uint32_t *p=param(6,16); p[0]=0; }
     CHECK(control(mixer,list)==0,"submixer control");
 
     begin();
-    { uint32_t *p=param(0x10000001,40); p[0]=0x12; p[1]=1; p[2]=48000; }   /* I16 mono 48 kHz */
+    { uint32_t *p=param(0x10000000,40); p[0]=0x12; p[1]=1; p[2]=48000; }   /* I16 mono 48 kHz */
     Block block={.offset=0,.size=sizeof(pcm),.repeats=1,.samples=N,.user=0x1234};
-    { unsigned char *p=param(0x10000002,32); const void *d=pcm; const void *b=&block;
+    { unsigned char *p=param(0x10000001,32); const void *d=pcm; const void *b=&block;
       memcpy(p,&d,8); uint32_t n=1; memcpy(p+12,&n,4); memcpy(p+16,&b,8); }
     { uint32_t *p=param(5,24); p[0]=0; *(void **)(p+2)=mixer; }      /* port 0 -> submixer */
-    { uint32_t *p=param(3,16); p[0]=0; float v=0.5f; memcpy(p+1,&v,4); }   /* port 0 volume 0.5 */
+    { uint32_t *p=param(2,16); p[0]=0; float v=0.5f; memcpy(p+1,&v,4); }   /* port 0 volume 0.5 */
     { unsigned char *p=param(7,32); void *f=(void *)on_block; memcpy(p,&f,8); }
     { uint32_t *p=param(6,16); p[0]=0; }                              /* play */
     CHECK(control(voice,list)==0,"sampler control");
@@ -126,9 +126,9 @@ int main(void) {
         CHECK(n==sizeof(vag),"read %s",bank);
         void *voice2; get_voice(samplers,1,&voice2);
         begin();
-        { uint32_t *p=param(0x10000001,40); p[0]=0x1C; p[1]=1; p[2]=48000; }
+        { uint32_t *p=param(0x10000000,40); p[0]=0x1C; p[1]=1; p[2]=48000; }
         Block vb={.offset=0,.size=(uint32_t)n,.repeats=0,.samples=0};
-        { unsigned char *p=param(0x10000002,32); const void *d=vag; const void *b=&vb;
+        { unsigned char *p=param(0x10000001,32); const void *d=vag; const void *b=&vb;
           memcpy(p,&d,8); uint32_t one=1; memcpy(p+12,&one,4); memcpy(p+16,&b,8); }
         { uint32_t *p=param(5,24); p[0]=0; *(void **)(p+2)=mixer; }
         { uint32_t *p=param(6,16); p[0]=0; }

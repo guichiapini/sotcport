@@ -20,6 +20,12 @@ MINGW*|MSYS*)
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
+    # This port's fixes to LibAtrac9 (frame alignment within superframes).
+    for patch in patches/libatrac9/*.patch; do
+        if ! git -C third_party/LibAtrac9 apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C third_party/LibAtrac9 apply "$PWD/$patch"
+        fi
+    done
     cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
         -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
     echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
@@ -67,6 +73,12 @@ fi
 for patch in gpu/patches/fsr-vulkan/*.patch; do
     if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+    fi
+done
+# This port's fixes to LibAtrac9 (frame alignment within superframes).
+for patch in patches/libatrac9/*.patch; do
+    if ! git -C third_party/LibAtrac9 apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+        git -C third_party/LibAtrac9 apply "$PWD/$patch"
     fi
 done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \

@@ -27,8 +27,20 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    // BB_DISPLAY=N: centred on the N-th monitor (1 = the first SDL reports), e.g. to keep
+    // automated test runs off the screen in use. Unknown numbers fall back to the default.
+    int position = SDL_WINDOWPOS_CENTERED;
+    if (const char* display = std::getenv("BB_DISPLAY")) {
+        int count = 0;
+        SDL_DisplayID* displays = SDL_GetDisplays(&count);
+        const int index = std::atoi(display) - 1;
+        if (displays && index >= 0 && index < count) {
+            position = static_cast<int>(SDL_WINDOWPOS_CENTERED_DISPLAY(displays[index]));
+        }
+        SDL_free(displays);
+    }
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, position);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, position);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);

@@ -5,11 +5,12 @@
  * a volume, to the input of the voice it is patched to. Submixer voices sum their inputs and
  * send them on the same way; mastering voices write the sum into the buffers the game passes
  * to sceNgs2SystemRender (which it then hands to AudioOut). Effects (filters, envelopes,
- * reverb, compressors, limiters) are accepted and not applied.
+ * reverb, compressors, limiters) are accepted and not applied; custom racks (0x400x) act as
+ * the plain rack of their class.
  *
- * Parameter IDs follow the SDK (voice 1..7, sampler 0x1000xxxx, submixer 0x2000xxxx,
- * mastering 0x3000xxxx). The first parameter lists are logged (BB_NGS2_TRACE=N lists N of
- * them, default 200): what the game sends is checked against these assumptions there. */
+ * Submixer and sampler voices may carry a user effect: a handler in the game that processes
+ * (or produces) the voice's signal each grain; SndX mixes its sounds there. The first
+ * parameters of each ID are logged (BB_NGS2_TRACE). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "../third_party/LibAtrac9/C/src/libatrac9.h"
@@ -27,16 +28,19 @@
 
 enum { HANDLE_SYSTEM=1, HANDLE_RACK=2, HANDLE_VOICE=3 };
 enum { KIND_SAMPLER, KIND_SUBMIXER, KIND_MASTERING, KIND_OTHER };
-enum { MAX_CH=8, MAX_PORTS=4, MAX_MATRICES=4, MAX_BLOCKS=32, MAX_GRAIN=1024, RATE=48000 };
+enum { MAX_CH=8, MAX_PORTS=8, MAX_MATRICES=4, MAX_BLOCKS=32, MAX_GRAIN=1024, RATE=48000 };
 
-/* Voice parameter IDs. */
+/* Voice parameter IDs, as CUSA08809 sends them: common ones from 1; per rack class, numbered
+ * from 0 in the order of the SDK's parameter structures (a submixer's setup is 0x20000000, its
+ * user effect 0x20000004 with a handler in the game, a mastering voice's output 0x30000005). */
 enum {
-    P_MATRIX_LEVELS=1, P_PORT_MATRIX=2, P_PORT_VOLUME=3, P_PORT_DELAY=4, P_PATCH=5, P_EVENT=6,
+    P_MATRIX_LEVELS=1, P_PORT_VOLUME=2, P_PORT_MATRIX=3, P_PORT_DELAY=4, P_PATCH=5, P_EVENT=6,
     P_CALLBACK=7,
-    S_SETUP=0x10000001, S_BLOCKS=0x10000002, S_ADDRESS=0x10000003, S_FRAME_OFFSET=0x10000004,
-    S_EXIT_LOOP=0x10000005, S_PITCH=0x10000006,
-    X_SETUP=0x20000001,
-    M_SETUP=0x30000001, M_OUTPUT=0x30000006,
+    S_SETUP=0x10000000, S_BLOCKS=0x10000001, S_ADDRESS=0x10000002, S_FRAME_OFFSET=0x10000003,
+    S_EXIT_LOOP=0x10000004, S_PITCH=0x10000005, S_USER_FX=0x10000008,
+    X_SETUP=0x20000000, X_USER_FX=0x20000004,
+    M_SETUP=0x30000000, M_OUTPUT=0x30000005,
+    C_SETUP=0x40020000,   /* custom submixer: input and output channels */
 };
 enum { EV_PLAY=0, EV_STOP=1, EV_STOP_IMM=2, EV_KILL=3, EV_PAUSE=4, EV_RESUME=5 };
 enum { ST_INUSE=0x1, ST_PLAYING=0x2, ST_PAUSED=0x4, ST_STOPPED=0x8, ST_ERROR=0x10, ST_EMPTY=0x20 };
@@ -56,6 +60,10 @@ typedef struct {
     uintptr_t user_data; const void *data; uint32_t data_size, repeated, attributes, reserved2;
 } CallbackInfo;
 typedef void (ABI *CallbackFn)(const CallbackInfo *);
+typedef struct {
+    float **channels; uintptr_t user_data[3]; uint32_t flags, num_channels, num_grain_samples, sample_rate;
+} UserFxContext;
+typedef int32_t (ABI *UserFxFn)(UserFxContext *);
 
 typedef struct Ngs2Handle Ngs2Handle;
 typedef struct Voice {
@@ -64,19 +72,23 @@ typedef struct Voice {
     struct { Ngs2Handle *dest; float volume; int matrix, used; } port[MAX_PORTS];
     struct { int levels; float level[MAX_CH*MAX_CH]; } matrix[MAX_MATRICES];
     CallbackFn callback; uintptr_t callback_data; uint32_t callback_flags;
+    UserFxFn fx; uintptr_t fx_data[3];  /* the game's own processing of this voice's signal */
+    int fx_started;                      /* the first call carries the start flag */
     float input[MAX_CH][MAX_GRAIN];     /* submixer/mastering: sum of the patched voices */
     int level;                           /* graph depth (render order) */
     uint32_t output_id;                  /* mastering */
     /* sampler */
     WaveFormat format;
     const uint8_t *data;
-    WaveBlock block[MAX_BLOCKS]; int blocks, current;
+    WaveBlock block[MAX_BLOCKS]; const uint8_t *block_base[MAX_BLOCKS]; int blocks, current;
+    uint64_t decoded_bytes;             /* waveform bytes consumed (the game streams by it) */
     uint32_t repeated, byte_pos, sample_pos;   /* within the current block */
     float pitch; double frac;
     float prev[MAX_CH], next[MAX_CH]; int primed;
     float decoded[256*MAX_CH]; int decoded_count, decoded_pos;   /* frames of the codec */
     int16_t vag_hist[MAX_CH][2];
-    void *at9; int at9_frame_samples, at9_channels;
+    void *at9; int at9_frame_samples, at9_channels, at9_superframe_size, at9_frames_per_superframe;
+    uint32_t at9_superframe_start; int at9_frame_in_superframe;   /* superframes have a fixed size */
     uint64_t decoded_samples;
 } Voice;
 struct Ngs2Handle {
@@ -103,12 +115,19 @@ static void ngs2_lock_init(void) {
 static void lock_ngs2(void) { pthread_once(&ngs2_lock_once,ngs2_lock_init); pthread_mutex_lock(&ngs2_lock); }
 static atomic_size_t ngs2_renders, ngs2_params;
 static int ngs2_valid(const Ngs2Handle *h, uint32_t type) { return h && h->magic==NGS2_MAGIC && h->type==type; }
-static long trace_limit(void) {
+/* BB_NGS2_TRACE=N: the first N parameters of each ID per rack type are logged (default 12). */
+static int tracing(uint32_t rack_id, uint32_t id) {
     static long limit=-1;
-    if (limit<0) { const char *v=getenv("BB_NGS2_TRACE"); limit=v ? atol(v) : 200; }
-    return limit;
+    static struct { uint32_t rack, id, count; } seen[256];
+    if (limit<0) { const char *v=getenv("BB_NGS2_TRACE"); limit=v ? atol(v) : 12; }
+    for (int i=0;i<256;++i) {
+        if ((seen[i].id==id && seen[i].rack==rack_id) || !seen[i].count) {
+            seen[i].id=id; seen[i].rack=rack_id;
+            return (long)seen[i].count++<limit;
+        }
+    }
+    return 0;
 }
-static int tracing(void) { return (long)atomic_load(&ngs2_params)<trace_limit(); }
 
 /* ---------------- handles ---------------- */
 static int rack_kind(uint32_t id) {
@@ -207,6 +226,7 @@ static ABI int32_t ngs2_rack_voice(Ngs2Handle *rack, uint32_t index, Ngs2Handle 
 }
 
 /* ---------------- parameters ---------------- */
+static int trace_on(void) { const char *t=getenv("BB_NGS2_TRACE"); return !t || atol(t)!=0; }
 static void trace_param(const Ngs2Handle *voice, const ParamHeader *p) {
     const uint32_t *w=(const uint32_t *)(p+1);
     unsigned words=p->size>sizeof(*p) ? (unsigned)(p->size-sizeof(*p))/4 : 0;
@@ -215,14 +235,21 @@ static void trace_param(const Ngs2Handle *voice, const ParamHeader *p) {
     for (unsigned i=0;i<words && i<12 && n<(int)sizeof(line)-12;++i) n+=snprintf(line+n,sizeof(line)-(size_t)n," %08x",w[i]);
     puts(line);
 }
+/* ATRAC9 configuration bytes: the format holds them with the first (0xFE) in the top byte. */
+static void at9_config(const Voice *v, unsigned char out[4]) {
+    uint32_t c=v->format.config;
+    out[0]=(unsigned char)(c>>24); out[1]=(unsigned char)(c>>16); out[2]=(unsigned char)(c>>8); out[3]=(unsigned char)c;
+}
 static void voice_event(Voice *v, uint32_t event) {
     switch (event) {
     case EV_PLAY:
         v->state=ST_INUSE|ST_PLAYING;
         if (v->kind==KIND_SAMPLER) {
             v->current=0; v->repeated=0; v->byte_pos=0; v->sample_pos=0; v->frac=0; v->primed=0;
+            v->decoded_bytes=0; v->decoded_samples=0;
             v->decoded_count=v->decoded_pos=0; memset(v->vag_hist,0,sizeof(v->vag_hist));
-            if (v->at9) Atrac9InitDecoder(v->at9,(unsigned char *)&v->format.config);
+            v->at9_frame_in_superframe=0;
+            if (v->at9) { unsigned char config[4]; at9_config(v,config); Atrac9InitDecoder(v->at9,config); }
             if (!v->blocks) v->state|=ST_EMPTY;
         }
         break;
@@ -240,11 +267,18 @@ static void sampler_setup(Voice *v, const WaveFormat *f) {
     if (v->at9) { Atrac9ReleaseHandle(v->at9); v->at9=NULL; }
     if (f->type==W_AT9) {
         v->at9=Atrac9GetHandle();
-        if (Atrac9InitDecoder(v->at9,(unsigned char *)&v->format.config)==0) {
+        unsigned char config[4]; at9_config(v,config);
+        if (Atrac9InitDecoder(v->at9,config)==0) {
             Atrac9CodecInfo info; Atrac9GetCodecInfo(v->at9,&info);
             v->at9_frame_samples=info.frameSamples; v->at9_channels=info.channels;
+            v->at9_superframe_size=info.superframeSize; v->at9_frames_per_superframe=info.framesInSuperframe;
+            static int shown;
+            if (shown++<4) printf("Runtime: Ngs2 ATRAC9 voice: %d ch, %d Hz, %d samples per frame\n",
+                                  info.channels,info.samplingRate,info.frameSamples);
         } else {
             v->at9_frame_samples=0;
+            static int failed;
+            if (failed++<4) printf("Runtime: Ngs2 ATRAC9 config %08x rejected\n",v->format.config);
         }
     }
     v->blocks=0; v->state=ST_INUSE;
@@ -259,6 +293,12 @@ static void apply_param(Ngs2Handle *voice, const ParamHeader *p) {
         if (id<MAX_MATRICES && levels) {
             if (count>MAX_CH*MAX_CH) count=MAX_CH*MAX_CH;
             v->matrix[id].levels=(int)count; memcpy(v->matrix[id].level,levels,count*sizeof(float));
+            static int shown;
+            if (trace_on() && shown++<6) {
+                char line[512]; int n=snprintf(line,sizeof(line),"Ngs2 matrix: rack %#x voice %u id %u, %u levels:",voice->rack_id,voice->index,id,count);
+                for (uint32_t k=0;k<count && n<(int)sizeof(line)-8;++k) n+=snprintf(line+n,sizeof(line)-(size_t)n," %.2g",levels[k]);
+                puts(line);
+            }
         }
         break;
     }
@@ -268,7 +308,17 @@ static void apply_param(Ngs2Handle *voice, const ParamHeader *p) {
     case P_PATCH: {
         uint32_t port=*(const uint32_t *)body;
         Ngs2Handle *dest=*(Ngs2Handle *const *)(body+8);
-        if (port<MAX_PORTS) { v->port[port].dest=ngs2_valid(dest,HANDLE_VOICE) ? dest : NULL; v->port[port].used=1; }
+        /* A rack as the destination (SndX patches samplers to its one-voice submixer racks)
+         * means its first voice. */
+        Ngs2Handle *target=ngs2_valid(dest,HANDLE_VOICE) ? dest :
+                           ngs2_valid(dest,HANDLE_RACK) && dest->voices ? &dest->voice[0] : NULL;
+        if (port<MAX_PORTS) { v->port[port].dest=target; v->port[port].used=1; }
+        static int shown[4];
+        if (trace_on() && shown[voice->kind&3]++<12)
+            printf("Ngs2 patch: rack %#x voice %u port %u -> %p (%s%s%#x, state %#x)\n",voice->rack_id,voice->index,port,
+                   (void *)dest,ngs2_valid(dest,HANDLE_VOICE) ? "voice of rack " : ngs2_valid(dest,HANDLE_RACK) ? "RACK " : "invalid ",
+                   "",dest && (ngs2_valid(dest,HANDLE_VOICE)||ngs2_valid(dest,HANDLE_RACK)) ? dest->rack_id : 0,
+                   ngs2_valid(dest,HANDLE_VOICE) ? dest->v->state : 0);
         break;
     }
     case P_EVENT: voice_event(v,*(const uint32_t *)body); break;
@@ -283,11 +333,25 @@ static void apply_param(Ngs2Handle *voice, const ParamHeader *p) {
         uint32_t count=*(const uint32_t *)(body+12);
         const WaveBlock *blocks=*(const WaveBlock *const *)(body+16);
         if (!blocks || !count) break;
-        /* A playing voice queues them after its own (streaming); otherwise they replace. */
-        int append=(v->state & ST_PLAYING) && !(v->state & ST_EMPTY) && data==v->data;
+        /* A playing voice queues them after its own (streaming: SndX adds blocks as it sees
+         * the decoded size grow); otherwise they replace. Consumed blocks are dropped first. */
+        int append=(v->state & ST_PLAYING) && !(v->state & ST_STOPPED);
         if (!append) { v->blocks=0; v->current=0; v->repeated=0; v->byte_pos=0; v->sample_pos=0; }
+        if (v->current>0) {
+            memmove(v->block,v->block+v->current,(size_t)(v->blocks-v->current)*sizeof(*v->block));
+            memmove(v->block_base,v->block_base+v->current,(size_t)(v->blocks-v->current)*sizeof(*v->block_base));
+            v->blocks-=v->current; v->current=0;
+        }
         v->data=data;
-        for (uint32_t i=0;i<count && v->blocks<MAX_BLOCKS;++i) v->block[v->blocks++]=blocks[i];
+        static int shown;
+        for (uint32_t i=0;i<count && v->blocks<MAX_BLOCKS;++i) {
+            if (trace_on() && shown++<24)
+                printf("Ngs2 block: rack %#x voice %u %s %p+%#x size %#x repeats %d skip %u samples %u (flags %#x)\n",
+                       voice->rack_id,voice->index,append ? "append" : "set",(const void *)data,blocks[i].offset,
+                       blocks[i].size,(int)blocks[i].repeats,blocks[i].skip,blocks[i].samples,*(const uint32_t *)(body+8));
+            v->block_base[v->blocks]=data;
+            v->block[v->blocks++]=blocks[i];
+        }
         v->state&=~(uint32_t)ST_EMPTY;
         break;
     }
@@ -299,6 +363,12 @@ static void apply_param(Ngs2Handle *voice, const ParamHeader *p) {
     case S_FRAME_OFFSET: v->format.frame_offset=*(const uint32_t *)body; break;
     case S_EXIT_LOOP: if (v->current<v->blocks) v->block[v->current].repeats=0; break;
     case S_PITCH: { float r=*(const float *)body; v->pitch=r>0.0f && r<16.0f ? r : 1.0f; break; }
+    case S_USER_FX: case X_USER_FX:
+        v->fx=*(UserFxFn const *)body;
+        for (int i=0;i<3;++i) v->fx_data[i]=*(const uintptr_t *)(body+8+8*i);
+        v->fx_started=0;
+        break;
+    case C_SETUP: { uint32_t ch=*(const uint32_t *)(body+4); v->channels=ch>=1 && ch<=MAX_CH ? (int)ch : 2; v->state|=ST_INUSE; break; }
     case X_SETUP: { uint32_t ch=*(const uint32_t *)body; v->channels=ch>=1 && ch<=MAX_CH ? (int)ch : 2; v->state|=ST_INUSE; break; }
     case M_SETUP: { uint32_t ch=*(const uint32_t *)body; v->channels=ch>=1 && ch<=MAX_CH ? (int)ch : 2; v->state|=ST_INUSE; break; }
     case M_OUTPUT: v->output_id=*(const uint32_t *)body; break;
@@ -310,7 +380,7 @@ static ABI int32_t ngs2_voice_control(Ngs2Handle *voice, const ParamHeader *para
     lock_ngs2();
     const ParamHeader *p=params;
     for (int n=0;p && n<256;++n) {
-        if (tracing()) trace_param(voice,p);
+        if (tracing(voice->rack_id,p->id)) trace_param(voice,p);
         atomic_fetch_add(&ngs2_params,1);
         apply_param(voice,p);
         if (!p->next) break;
@@ -329,8 +399,16 @@ static ABI int32_t ngs2_voice_state(Ngs2Handle *voice, void *state, uint64_t siz
     lock_ngs2();
     const Voice *v=voice->v;
     SamplerState s={.flags=v->state,.envelope=1.0f,.peak=0.0f,.decoded_samples=v->decoded_samples,
-                    .waveform=v->data};
-    if (v->current<v->blocks) s.user_data=v->block[v->current].user;
+                    .decoded_size=v->decoded_bytes,.waveform=v->data};
+    if (v->current<v->blocks) {
+        s.user_data=v->block[v->current].user;
+        s.waveform=v->block_base[v->current]+v->block[v->current].offset+v->byte_pos;
+    }
+    static int shown;
+    if (voice->kind==KIND_SAMPLER && trace_on() && shown++<12)
+        printf("Ngs2 state query: voice %u, %llu bytes asked, flags %#x, decoded %llu samples / %llu bytes\n",
+               voice->index,(unsigned long long)size,v->state,(unsigned long long)v->decoded_samples,
+               (unsigned long long)v->decoded_bytes);
     pthread_mutex_unlock(&ngs2_lock);
     memset(state,0,size);
     memcpy(state,&s,size<sizeof(s) ? size : sizeof(s));
@@ -394,7 +472,7 @@ static void block_end(Ngs2Handle *voice) {
     WaveBlock *b=&v->block[v->current];
     if (v->callback) {
         CallbackInfo info={.callback_data=v->callback_data,.voice=voice,.flag=1,.user_data=b->user,
-                           .data=v->data+b->offset,.data_size=b->size,.repeated=v->repeated};
+                           .data=v->block_base[v->current]+b->offset,.data_size=b->size,.repeated=v->repeated};
         v->callback(&info);
     }
     if (b->repeats==UINT32_MAX || v->repeated<b->repeats) {
@@ -404,15 +482,16 @@ static void block_end(Ngs2Handle *voice) {
     }
     v->byte_pos=0; v->sample_pos=0; v->decoded_count=v->decoded_pos=0;
     memset(v->vag_hist,0,sizeof(v->vag_hist));
+    v->at9_frame_in_superframe=0;
     if (v->current>=v->blocks) v->state=(v->state&~(uint32_t)ST_PLAYING)|ST_STOPPED|ST_EMPTY;
 }
 /* Fills v->decoded with the next frames of the current block; 0 at the end of the waveform. */
 static int decode_more(Ngs2Handle *voice) {
     Voice *v=voice->v;
     for (int guard=0;guard<8;++guard) {
-        if (v->current>=v->blocks || !v->data) return 0;
+        if (v->current>=v->blocks) return 0;
         WaveBlock *b=&v->block[v->current];
-        const uint8_t *base=v->data+b->offset;
+        const uint8_t *base=v->block_base[v->current]+b->offset;
         uint32_t limit=b->samples ? b->samples : UINT32_MAX;
         int ch=v->channels;
         v->decoded_pos=0; v->decoded_count=0;
@@ -422,21 +501,43 @@ static int decode_more(Ngs2Handle *voice) {
                 uint32_t frame=bytes*(uint32_t)ch, n=0;
                 while (n<256 && v->byte_pos+frame<=b->size && v->sample_pos<limit) {
                     for (int c=0;c<ch;++c) v->decoded[n*ch+c]=pcm_sample(type,base+v->byte_pos+(uint32_t)c*bytes);
-                    v->byte_pos+=frame; ++v->sample_pos; ++n;
+                    v->byte_pos+=frame; v->decoded_bytes+=frame; ++v->sample_pos; ++n;
                 }
                 v->decoded_count=(int)n;
             } else if (type==W_VAG) {
                 uint32_t need=16u*(uint32_t)ch;
                 if (v->byte_pos+need<=b->size) {
                     for (int c=0;c<ch;++c) vag_decode(v,base+v->byte_pos+16u*(uint32_t)c,c,v->decoded+c,ch);
-                    v->byte_pos+=need;
+                    v->byte_pos+=need; v->decoded_bytes+=need;
                     uint32_t n=28; if (v->sample_pos+n>limit) n=limit-v->sample_pos;
                     v->sample_pos+=n; v->decoded_count=(int)n;
                 } else v->byte_pos=b->size;
             } else if (type==W_AT9 && v->at9 && v->at9_frame_samples>0 && v->at9_frame_samples<=256) {
                 int16_t pcm[256*MAX_CH]; int used=0;
-                if (Atrac9Decode(v->at9,base+v->byte_pos,pcm,&used)==0 && used>0) {
+                int e=Atrac9Decode(v->at9,base+v->byte_pos,pcm,&used);
+                if (e || used<=0) {
+                    static int shown;
+                    if (trace_on() && shown++<8)
+                    {
+                        const uint8_t *at=base+v->byte_pos;
+                        printf("Ngs2 ATRAC9 decode error %d at byte %#x of %#x (voice %u, frame %d ch, decoded %llu bytes): "
+                               "%02x %02x %02x %02x %02x %02x %02x %02x | -16: %02x %02x %02x %02x\n",e,v->byte_pos,b->size,
+                               voice->index,v->at9_channels,(unsigned long long)v->decoded_bytes,at[0],at[1],at[2],at[3],
+                               at[4],at[5],at[6],at[7],at[-16],at[-15],at[-14],at[-13]);
+                    }
+                }
+                if (e==0 && used>0) {
+                    const uint32_t start=v->byte_pos;
+                    if (v->at9_frame_in_superframe==0) v->at9_superframe_start=v->byte_pos;
                     v->byte_pos+=(uint32_t)used;
+                    /* A superframe has a fixed size; its frames may end before it (padding):
+                     * the next superframe starts at its boundary. */
+                    if (++v->at9_frame_in_superframe>=v->at9_frames_per_superframe) {
+                        v->at9_frame_in_superframe=0;
+                        if (v->at9_superframe_size>0)
+                            v->byte_pos=v->at9_superframe_start+(uint32_t)v->at9_superframe_size;
+                    }
+                    v->decoded_bytes+=v->byte_pos-start;   /* padding included */
                     int n=v->at9_frame_samples, ach=v->at9_channels;
                     for (int i=0;i<n;++i) for (int c=0;c<ch;++c) v->decoded[i*ch+c]=(c<ach ? pcm[i*ach+c] : 0)/32768.0f;
                     if (v->sample_pos+(uint32_t)n>limit) n=(int)(limit-v->sample_pos);
@@ -491,10 +592,43 @@ static void sampler_render(Ngs2Handle *voice, float out[MAX_CH][MAX_GRAIN], uint
 }
 
 /* ---------------- graph ---------------- */
+/* Signal levels per stage since the last report (BB_NGS2_TRACE != 0), for silence hunts. */
+static struct {
+    uint32_t inuse, playing; uint64_t decoded; float sampler, premix, mixer, master; uint32_t mixers, masters, fx;
+    uint32_t sent, no_dest, idle_dest, unpatched, sampler_sends; float max_gain, sampler_out;
+} stage;
+/* Effects whose process reads channel pointers 8..15 take them as outputs. They get buffers of
+ * their own holding a copy of the input; if the effect changed them, they are its result (an
+ * aliased output cleared before accumulating erased the input: silence), else the input,
+ * possibly changed in place, is. */
+static float fx_out[MAX_CH][MAX_GRAIN], fx_copy[MAX_CH][MAX_GRAIN];
+static void run_user_fx(Voice *v, float buffers[MAX_CH][MAX_GRAIN], uint32_t grain) {
+    if (!v->fx) return;
+    float *channels[2*MAX_CH];
+    for (int c=0;c<MAX_CH;++c) {
+        channels[c]=buffers[c]; channels[MAX_CH+c]=fx_out[c];
+        memcpy(fx_out[c],buffers[c],grain*sizeof(float));
+        memcpy(fx_copy[c],buffers[c],grain*sizeof(float));
+    }
+    /* Flags: 0x1 on the first call (SndX's effects set up their state there; without it they
+     * processed through null buffers), 0x4/0x8 would bypass. */
+    UserFxContext context={channels,{v->fx_data[0],v->fx_data[1],v->fx_data[2]},
+                           v->fx_started ? 0u : 1u,(uint32_t)v->channels,grain,RATE};
+    v->fx_started=1;
+    v->fx(&context);
+    for (int c=0;c<v->channels;++c)
+        if (memcmp(fx_out[c],fx_copy[c],grain*sizeof(float))!=0) {
+            for (int k=0;k<v->channels;++k) memcpy(buffers[k],fx_out[k],grain*sizeof(float));
+            return;
+        }
+}
 static void send_ports(Voice *v, float src[MAX_CH][MAX_GRAIN], uint32_t grain) {
     for (int p=0;p<MAX_PORTS;++p) {
         Ngs2Handle *dest=v->port[p].dest;
-        if (!dest || !ngs2_valid(dest,HANDLE_VOICE) || !(dest->v->state & ST_INUSE)) continue;
+        if (!dest) { if (v->port[p].used) ++stage.no_dest; else if (p==0) ++stage.unpatched; continue; }
+        if (!ngs2_valid(dest,HANDLE_VOICE) || !(dest->v->state & ST_INUSE)) { ++stage.idle_dest; continue; }
+        ++stage.sent;
+        if (v->kind==KIND_SAMPLER) ++stage.sampler_sends;
         Voice *d=dest->v;
         float vol=v->port[p].volume;
         int in=v->channels, out=d->channels;
@@ -508,6 +642,7 @@ static void send_ports(Voice *v, float src[MAX_CH][MAX_GRAIN], uint32_t grain) {
                 else if (in==1) g=o<2 ? 1.0f : 0.0f;               /* mono to the front pair */
                 else g=o==i ? 1.0f : 0.0f;
                 g*=vol;
+                if (v->kind==KIND_SAMPLER && fabsf(g)>stage.max_gain) stage.max_gain=fabsf(g);
                 if (g==0.0f) continue;
                 for (uint32_t s=0;s<grain;++s) d->input[o][s]+=src[i][s]*g;
             }
@@ -545,6 +680,12 @@ static void write_output(const RenderBufferInfo *b, uint32_t offset, Voice *m, u
     }
 }
 static float scratch[MAX_CH][MAX_GRAIN];
+
+static float peak_of(float b[MAX_CH][MAX_GRAIN], int channels, uint32_t n) {
+    float p=0;
+    for (int c=0;c<channels;++c) for (uint32_t i=0;i<n;++i) { float x=fabsf(b[c][i]); if (x>p) p=x; }
+    return p;
+}
 static ABI int32_t ngs2_system_render(Ngs2Handle *h, const RenderBufferInfo *buffers, uint32_t count) {
     if (!ngs2_valid(h,HANDLE_SYSTEM)) return NGS2_ERR_INVALID_HANDLE;
     if (!buffers && count) return NGS2_ERR_INVALID_BUFFER_INFO;
@@ -580,7 +721,11 @@ static ABI int32_t ngs2_system_render(Ngs2Handle *h, const RenderBufferInfo *buf
             for (uint32_t i=0;i<r->voices;++i) {
                 Voice *v=r->voice[i].v;
                 if (!(v->state & ST_PLAYING) || (v->state & ST_PAUSED)) continue;
+                uint64_t before=v->decoded_samples;
                 sampler_render(&r->voice[i],scratch,n);
+                stage.decoded+=v->decoded_samples-before;
+                { float p=peak_of(scratch,v->channels,n); if (p>stage.sampler) stage.sampler=p; }
+                run_user_fx(v,scratch,n);
                 send_ports(v,scratch,n);
             }
         }
@@ -590,6 +735,14 @@ static ABI int32_t ngs2_system_render(Ngs2Handle *h, const RenderBufferInfo *buf
                 for (uint32_t i=0;i<r->voices;++i) {
                     Voice *v=r->voice[i].v;
                     if (!(v->state & ST_INUSE) || v->level!=level) continue;
+                    if (v->fx) ++stage.fx;
+                    { float p=peak_of(v->input,v->channels,n); if (p>stage.premix) stage.premix=p; }
+                    run_user_fx(v,v->input,n);
+                    {
+                        float p=peak_of(v->input,v->channels,n);
+                        if (r->kind==KIND_MASTERING || level==0) { ++stage.masters; if (p>stage.master) stage.master=p; }
+                        else { ++stage.mixers; if (p>stage.mixer) stage.mixer=p; }
+                    }
                     if (r->kind==KIND_MASTERING || level==0) {
                         uint32_t out=v->output_id<count ? v->output_id : 0;
                         if (count && buffers[out].buffer) write_output(&buffers[out],offset,v,n);
@@ -600,7 +753,40 @@ static ABI int32_t ngs2_system_render(Ngs2Handle *h, const RenderBufferInfo *buf
             }
     }
     pthread_mutex_unlock(&ngs2_lock);
-    atomic_fetch_add(&ngs2_renders,1);
+    for (Ngs2Handle *r=h->next_rack;r;r=r->next_rack)
+        if (r->kind==KIND_SAMPLER)
+            for (uint32_t i=0;i<r->voices;++i) {
+                if (r->voice[i].v->state & ST_INUSE) ++stage.inuse;
+                if (r->voice[i].v->state & ST_PLAYING) ++stage.playing;
+            }
+    size_t renders=atomic_fetch_add(&ngs2_renders,1)+1;
+    static long report=-1;
+    if (report<0) { const char *t=getenv("BB_NGS2_TRACE"); report=t && atol(t)==0 ? 0 : 1; }
+    if (report && renders%1000==0) {
+        printf("Ngs2 levels (1000 renders): samplers in use %u playing %u (avg), decoded %llu, peaks sampler %.4f "
+               "mixer inputs %.4f submixer %.4f mastering %.4f; %u submixer, %u mastering, %u effect runs; sends %u, to nothing %u, to idle %u, unpatched %u; sampler sends %u max gain %.3f (vol %s)\n",
+               stage.inuse/1000,stage.playing/1000,(unsigned long long)stage.decoded,stage.sampler,stage.premix,stage.mixer,
+               stage.master,stage.mixers,stage.masters,stage.fx,stage.sent,stage.no_dest,stage.idle_dest,stage.unpatched,stage.sampler_sends,stage.max_gain,"");
+        memset(&stage,0,sizeof(stage));
+        int shown=0;
+        for (Ngs2Handle *r=h->next_rack;r && shown<4;r=r->next_rack)
+            if (r->kind==KIND_SAMPLER)
+                for (uint32_t i=0;i<r->voices && shown<4;++i) {
+                    Voice *v=r->voice[i].v;
+                    if (!(v->state & ST_PLAYING)) continue;
+                    ++shown;
+                    char line[512]; int n=snprintf(line,sizeof(line),"  voice %u: %d ch type %#x pitch %.2f:",i,v->channels,v->format.type,v->pitch);
+                    for (int p=0;p<MAX_PORTS && n<(int)sizeof(line)-60;++p) {
+                        if (!v->port[p].dest) continue;
+                        float sum=0; int m=v->port[p].matrix;
+                        if (m>=0 && m<MAX_MATRICES) for (int k=0;k<v->matrix[m].levels;++k) sum+=fabsf(v->matrix[m].level[k]);
+                        n+=snprintf(line+n,sizeof(line)-(size_t)n," port %d vol %.3f matrix %d (%d levels, sum %.3f) -> rack %#x ch %d;",
+                                    p,v->port[p].volume,m,m>=0 && m<MAX_MATRICES ? v->matrix[m].levels : 0,sum,
+                                    v->port[p].dest->rack_id,v->port[p].dest->v->channels);
+                    }
+                    puts(line);
+                }
+    }
     return 0;
 }
 

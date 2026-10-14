@@ -10,6 +10,8 @@ cd -- "$(dirname -- "$0")/../.."
 dump=$PWD/out/sotc-dump/$(date +%Y%m%d-%H%M%S); trigger=$dump/.trigger; pad=$dump/pad.txt
 mkdir -p "$dump"
 [[ -n ${SOTC_PAD:-} ]] && { : > "$pad"; export BB_PAD_FILE=$pad; }
+# Test runs open on the second monitor (BB_DISPLAY=1 for the main one).
+export BB_DISPLAY=${BB_DISPLAY:-2}
 export BB_DUMP_DIR=$dump BB_FRAME_DUMP_TRIGGER=$trigger BB_CAPTURE_TRIGGER=$dump/.analyze BB_CAPTURE_DIR=$dump SOTC_SKIP_PREPARE=${SOTC_SKIP_PREPARE:-1}
 timeout "${SOTC_TIMEOUT:-100}" python tools/sotc/run_sotc.py > out/sotc-run.log 2>&1 &
 game=$!

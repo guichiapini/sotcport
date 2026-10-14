@@ -1,0 +1,14 @@
+diff --git a/C/src/decoder.c b/C/src/decoder.c
+index 9b9f0ba..7958942 100644
+--- a/C/src/decoder.c
++++ b/C/src/decoder.c
+@@ -21,7 +21,8 @@ At9Status Decode(Atrac9Handle* handle, const unsigned char* audio, unsigned char
+ 
+ 	PcmFloatToShort(&handle->Frame, (short*)pcm);
+ 
+-	*bytesUsed = br.Position / 8;
++	/* Frames of a superframe start on byte boundaries (the C# original aligns after each). */
++	*bytesUsed = (br.Position + 7) / 8;
+ 	return ERR_SUCCESS;
+ }
+ 

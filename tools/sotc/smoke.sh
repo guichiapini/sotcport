@@ -7,7 +7,7 @@
 set -uo pipefail
 cd -- "$(dirname -- "$0")/../.."
 seconds=${1:-120}
-export BB_FRAME_STATS=1 BB_READ_FAULT_STATS=1 BB_GPU_PROFILE=1
+export BB_FRAME_STATS=1 BB_READ_FAULT_STATS=1 BB_GPU_PROFILE=1 BB_BUFFER_STATS=${BB_BUFFER_STATS:-0}
 audio=$PWD/out/smoke-audio
 rm -rf -- "$audio"; mkdir -p "$audio"
 # Windows paths: the probe and Python read these, not MSYS.
@@ -18,4 +18,4 @@ SOTC_TIMEOUT=$seconds bash tools/sotc/capture.sh 30 60 90 110 > out/smoke-captur
 dump=$(tail -1 out/smoke-capture.txt)
 python tools/sotc/sheet.py "$dump" 4 > /dev/null 2>&1
 python tools/sotc/smoke_report.py out/sotc-run.log "$audio_w" "$(cygpath -w "$dump" 2>/dev/null || echo "$dump")" | tee out/smoke-report.txt
-rm -rf -- "$audio"
+# The dumps are kept (out/smoke-audio) for listening; the next run clears them.
