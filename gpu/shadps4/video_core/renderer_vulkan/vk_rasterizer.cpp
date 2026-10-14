@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
 
@@ -1232,6 +1233,56 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (is_indexed) {
         ResolveIndexBuffer(0);
     }
+    // bbport (sotc): BB_INDIRECT_PROBE=N copies, for one indirect draw in N, the draw count
+    // and first argument record the GPU holds and prints them once that work completed.
+    static const u32 probe_every = [] {
+        const char* v = std::getenv("BB_INDIRECT_PROBE");
+        return v ? u32(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    static std::atomic<u32> probe_draws{0};
+    if (probe_every && probe_draws.fetch_add(1, std::memory_order_relaxed) % probe_every == 0) {
+        const VkBufferCreateInfo probe_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                          .size = 32,
+                                          .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo probe_alloc{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+        VkBuffer probe{};
+        VmaAllocation probe_memory{};
+        VmaAllocationInfo probe_info{};
+        if (vmaCreateBuffer(instance.GetAllocator(), &probe_ci, &probe_alloc, &probe, &probe_memory,
+                            &probe_info) == VK_SUCCESS) {
+            std::memset(probe_info.pMappedData, 0xff, 32);
+            scheduler.EndRendering();
+            const vk::Buffer args_handle = buffer->Handle();
+            const vk::Buffer count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{};
+            const u64 args_at = base, count_at = count_offset;
+            scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+                const vk::MemoryBarrier2 before{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+                cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+                cmdbuf.copyBuffer(args_handle, probe, vk::BufferCopy{args_at, 0, 20});
+                if (count_handle) {
+                    cmdbuf.copyBuffer(count_handle, probe, vk::BufferCopy{count_at, 20, 4});
+                }
+            });
+            const VAddr args_address = indirect.args;
+            scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), probe,
+                                              probe_memory, probe_info, max_count, args_address,
+                                              vs = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash] {
+                vmaInvalidateAllocation(allocator, probe_memory, 0, VK_WHOLE_SIZE);
+                const auto* v = static_cast<const u32*>(probe_info.pMappedData);
+                std::printf("Indirect: vs %08llx args %#llx max %u count %d first {%u %u %u %d %u}\n",
+                            (unsigned long long)vs, (unsigned long long)args_address, max_count,
+                            int(v[5]), v[0], v[1], v[2], int(v[3]), v[4]);
+                vmaDestroyBuffer(allocator, probe, probe_memory);
+            });
+        }
+    }
+
     const auto state = BeginRendering(pipeline);
     EmitVertexBuffers();
     if (is_indexed) {
@@ -2166,9 +2217,40 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     const char* w = std::getenv("BB_WATCH_SIZE");
                     return w ? u64(std::strtoull(w, nullptr, 10)) : u64(0);
                 }();
+                // BB_WATCH_SHADER=<hex hash> BB_WATCH_SLOT=<n>: watch the range that shader
+                // reads in that slot (the latest one seen), in the same run.
+                static const u64 watch_shader = [] {
+                    const char* w = std::getenv("BB_WATCH_SHADER");
+                    return w ? u64(std::strtoull(w, nullptr, 16)) : u64(0);
+                }();
+                static const u32 watch_slot = [] {
+                    const char* w = std::getenv("BB_WATCH_SLOT");
+                    return w ? u32(std::strtoul(w, nullptr, 10)) : 0u;
+                }();
+                static std::atomic<VAddr> watch_begin{0}, watch_end{0};
+                static std::atomic<u32> watch_binds{0};
+                if (watch_shader && stage.pgm_hash == watch_shader && binding.buffer == watch_slot &&
+                    (watch_begin.exchange(vsharp.base_address) != vsharp.base_address ||
+                     watch_binds.fetch_add(1, std::memory_order_relaxed) % 4000 == 0)) {
+                    watch_end = vsharp.base_address + size;
+                    // Distinct 128-byte records in the guest's copy (instance data the CPU wrote).
+                    std::set<u64> distinct;
+                    const auto* records = reinterpret_cast<const u8*>(vsharp.base_address);
+                    for (u64 at = 0; at + 128 <= size && distinct.size() < 100000; at += 128) {
+                        distinct.insert(XXH3_64bits(records + at, 128));
+                    }
+                    std::printf("Watch: shader %#llx slot %u reads %#llx+%llu: %zu distinct records\n",
+                                (unsigned long long)watch_shader, watch_slot,
+                                (unsigned long long)vsharp.base_address, (unsigned long long)size,
+                                distinct.size());
+                }
+                const VAddr wb = watch_begin.load(std::memory_order_relaxed);
+                const VAddr we = watch_end.load(std::memory_order_relaxed);
                 if (desc.is_written && ((watch && vsharp.base_address <= watch &&
                                          watch < vsharp.base_address + size) ||
-                                        (watch_size && vsharp.GetSize() == watch_size))) {
+                                        (watch_size && vsharp.GetSize() == watch_size) ||
+                                        (wb && vsharp.base_address < we &&
+                                         wb < vsharp.base_address + size))) {
                     static std::atomic<int> watch_logs{0};
                     if (watch_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
                         std::printf("Watch: stage %#llx writes buffer %#llx+%llu (slot %u)\n",
@@ -2179,6 +2261,55 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                // bbport (sotc): the GPU's copy of the watched slot, compared after it ran.
+                static std::atomic<u32> gpu_checks{0};
+                if (watch_shader && stage.pgm_hash == watch_shader && binding.buffer == watch_slot &&
+                    gpu_checks.fetch_add(1, std::memory_order_relaxed) % 4000 == 0) {
+                    const u64 bytes = std::min<u64>(size, 64 * 1024);
+                    const VkBufferCreateInfo ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                                .size = bytes,
+                                                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                    const VmaAllocationCreateInfo ai{
+                        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+                    VkBuffer copy{};
+                    VmaAllocation copy_memory{};
+                    VmaAllocationInfo copy_info{};
+                    if (vmaCreateBuffer(instance.GetAllocator(), &ci, &ai, &copy, &copy_memory,
+                                        &copy_info) == VK_SUCCESS) {
+                        std::vector<u8> cpu(bytes);
+                        std::memcpy(cpu.data(), reinterpret_cast<const void*>(vsharp.base_address), bytes);
+                        scheduler.EndRendering();
+                        const vk::Buffer src = buffer->Handle();
+                        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+                            const vk::MemoryBarrier2 before{
+                                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+                            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+                            cmdbuf.copyBuffer(src, copy, vk::BufferCopy{offset, 0, bytes});
+                        });
+                        scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), copy,
+                                                          copy_memory, copy_info, bytes,
+                                                          cpu = std::move(cpu)] {
+                            vmaInvalidateAllocation(allocator, copy_memory, 0, VK_WHOLE_SIZE);
+                            const auto* gpu = static_cast<const u8*>(copy_info.pMappedData);
+                            std::set<u64> distinct;
+                            u64 differing = 0;
+                            for (u64 at = 0; at + 128 <= bytes; at += 128) {
+                                distinct.insert(XXH3_64bits(gpu + at, 128));
+                                differing += std::memcmp(gpu + at, cpu.data() + at, 128) != 0;
+                            }
+                            std::printf("Watch: GPU copy of %llu bytes: %zu distinct records, %llu "
+                                        "differ from the CPU copy at bind time\n",
+                                        (unsigned long long)bytes, distinct.size(),
+                                        (unsigned long long)differing);
+                            vmaDestroyBuffer(allocator, copy, copy_memory);
+                        });
+                    }
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {

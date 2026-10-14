@@ -167,7 +167,12 @@ void FaultManager::ProcessFaultBuffer() {
         const u32 fault_count = fault_buf[0];
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
-            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
+            // bbport (sotc): shown for the first faults (which guest memory DMA shaders reach).
+            static std::atomic<int> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 64) {
+                std::printf("DMA fault: page %#llx (of %u this batch)\n",
+                            (unsigned long long)fault_buf[i], fault_count);
+            }
         }
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),

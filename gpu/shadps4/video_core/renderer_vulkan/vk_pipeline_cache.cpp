@@ -1013,6 +1013,7 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     const auto file = IOFile{patch_dir / filename, FileAccessMode::Read};
     std::vector<u32> code(file.GetSize() / sizeof(u32));
     file.Read(code);
+    std::printf("Shader patch: %s\n", filename.c_str()); // bbport (sotc)
     return code;
 }
 } // namespace Vulkan

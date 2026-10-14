@@ -164,6 +164,9 @@ private:
 
 using SharpSources = boost::container::small_vector<const IR::Inst*, 4>;
 
+// bbport (sotc): shader being patched, named when a sharp cannot be located.
+static thread_local u64 patching_hash;
+
 SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     SharpLocation location{};
     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
@@ -174,7 +177,8 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
         location = inst->Flags<SharpLocation>();
     }
     if (location == 0) {
-        LOG_WARNING(Render_Recompiler, "Sharp source was not flatenned");
+        LOG_WARNING(Render_Recompiler, "Sharp source was not flatenned (shader {:#018x}, source {})",
+                    patching_hash, IR::NameOf(inst->GetOpcode()));
         return UNKNOWN_LOCATION;
     }
     return location;
@@ -939,6 +943,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
 
 void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resources,
                           const Profile& profile) {
+    patching_hash = info.pgm_hash;
     // Iterate over discovered resources and patch them after finding the sharp.
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};

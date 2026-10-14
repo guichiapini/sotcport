@@ -454,8 +454,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                             found.push_back(id);
                         }
                     });
-                    for (const auto id : found) {
-                        auto& target = texture_cache.GetImage(id);
+                    for (size_t n = 0; n < found.size(); ++n) {
+                        auto& target = texture_cache.GetImage(found[n]);
                         const bool depth = bool(target.aspect_mask & vk::ImageAspectFlagBits::eDepth);
                         const u32 bpp = depth ? 4 : std::max(1u, target.info.num_bits / 8);
                         runtime.Transit(&target, vk::ImageLayout::eTransferSrcOptimal,
@@ -463,8 +463,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                         vk::AccessFlagBits2::eTransferRead);
                         runtime.FlushBarriers();
                         char name[96];
-                        std::snprintf(name, sizeof(name), "img%llx_%ubpp%s",
-                                      (unsigned long long)address, bpp, depth ? "_depth" : "");
+                        std::snprintf(name, sizeof(name), "img%llx_%zu_%ubpp%s",
+                                      (unsigned long long)address, n, bpp, depth ? "_depth" : "");
                         DumpRaw(instance, draw_scheduler, cmdbuf, target.GetImage(),
                                 vk::ImageLayout::eTransferSrcOptimal, target.info.size.width,
                                 target.info.size.height, name, frame_dump_index, bpp,
