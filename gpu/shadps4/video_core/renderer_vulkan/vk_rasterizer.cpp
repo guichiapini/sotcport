@@ -3357,7 +3357,38 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
         }
         return false;
     }
+    // bbport (sotc): BB_READ_FAULT_STATS=1: readbacks per second, time and where.
+    static const bool fault_stats = std::getenv("BB_READ_FAULT_STATS") != nullptr;
+    const auto start = fault_stats ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
+    if (fault_stats) {
+        static std::mutex stats_mutex;
+        static std::map<VAddr, u32> regions;
+        static u64 count = 0, ns = 0;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lk{stats_mutex};
+        ++count;
+        ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+        ++regions[addr & ~0xffffull];
+        if (now - last > std::chrono::seconds(5)) {
+            std::string top;
+            std::vector<std::pair<u32, VAddr>> sorted;
+            for (const auto& [a, n] : regions) {
+                sorted.emplace_back(n, a);
+            }
+            std::ranges::sort(sorted, std::greater{});
+            for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+                top += fmt::format(" {:#x}:{}", sorted[i].second, sorted[i].first);
+            }
+            std::printf("Read faults: %.1f/s, %.1f ms/s, %s thread; regions%s\n",
+                        count / 5.0, ns / 5e6, assume_locks ? "GPU" : "guest", top.c_str());
+            count = ns = 0;
+            regions.clear();
+            last = now;
+        }
+    }
     return true;
 }
 

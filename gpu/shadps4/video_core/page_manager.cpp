@@ -206,7 +206,11 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
-        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+        // bbport (sotc): CUSA08809 tracks such regions ~100 times a second; shown a few times.
+        static std::atomic<u32> unmapped_shown{0};
+        if (unmapped_shown.load(std::memory_order_relaxed) < 32 &&
+            !rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr) &&
+            unmapped_shown.fetch_add(1, std::memory_order_relaxed) < 32) {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);

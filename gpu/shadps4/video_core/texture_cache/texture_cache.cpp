@@ -26,6 +26,16 @@ namespace VideoCore {
 /// bbport (sotc): hash of guest memory that may not be mapped (a texture the game points at
 /// memory it only reserved): a fault yields a hash that never matches instead of a crash.
 [[gnu::noinline]] static u64 GuardedHash(const u8* data, u64 size) {
+    // Precise readbacks deny reads of GPU-written pages: a fault here downloaded the data with
+    // a full GPU wait (render targets of every frame, hundreds of times a second). The upload
+    // that follows reads the backing view too (CopySparseMemory), so the hash does the same.
+    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        thread_local std::vector<u8> copy;
+        copy.resize(size);
+        Core::Memory::Instance()->CopySparseMemory(reinterpret_cast<VAddr>(data), copy.data(),
+                                                   size);
+        return XXH3_64bits(copy.data(), size);
+    }
     sigjmp_buf recover;
     if (sigsetjmp(recover, 0)) {
         runtime_fault_recover = nullptr;

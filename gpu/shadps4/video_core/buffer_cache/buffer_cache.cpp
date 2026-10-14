@@ -24,6 +24,13 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace VideoCore {
 
@@ -201,6 +208,30 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
+    // bbport (sotc): BB_READ_FAULT_STATS=2 shows the first downloads (ranges, bytes).
+    static const bool show = [] {
+        const char* v = std::getenv("BB_READ_FAULT_STATS");
+        return v && v[0] == '2';
+    }();
+    static std::atomic<u32> shown{0};
+    if (show && shown.fetch_add(1, std::memory_order_relaxed) < 400) {
+        std::string ranges;
+        for (const auto& copy : copies) {
+            ranges += fmt::format(" {:#x}+{:#x}", arena_base + copy.srcOffset, copy.size);
+        }
+        void* frames[12]{};
+        const u16 n = CaptureStackBackTrace(1, 12, frames, nullptr);
+        for (u16 i = 0; i < n; ++i) {
+            HMODULE module{};
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(frames[i]), &module);
+            ranges += fmt::format(" @{:#x}", reinterpret_cast<uintptr_t>(frames[i]) -
+                                                 reinterpret_cast<uintptr_t>(module));
+        }
+        std::printf("Download for %#llx: %llu bytes:%s\n", (unsigned long long)device_addr,
+                    (unsigned long long)total_size_bytes, ranges.c_str());
+    }
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
