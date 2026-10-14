@@ -784,3 +784,6 @@ void runtime_file_report(void) {
            opens,reads,(unsigned long long)bytes_read,writes,missing);
 }
 
+/* Bytes read and reads so far (heartbeat). */
+uint64_t runtime_file_bytes_read(void) { return __atomic_load_n(&bytes_read,__ATOMIC_RELAXED); }
+uint64_t runtime_file_reads(void) { return __atomic_load_n(&reads,__ATOMIC_RELAXED); }

@@ -286,6 +286,18 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
 
 void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* dma_data = reinterpret_cast<const PM4DmaData*>(data);
+    // bbport (sotc): BB_DMA_LOG=N prints the first N DMA packets (porting aid).
+    static const long dma_log = [] {
+        const char* env = std::getenv("BB_DMA_LOG");
+        return env ? std::strtol(env, nullptr, 10) : 0L;
+    }();
+    static std::atomic<long> dma_logged{0};
+    if (dma_log && dma_logged.fetch_add(1, std::memory_order_relaxed) < dma_log) {
+        std::printf("DMA: src_sel=%u dst_sel=%u src=%#llx dst=%#llx bytes=%u\n",
+                    u32(dma_data->src_sel), u32(dma_data->dst_sel),
+                    (unsigned long long)dma_data->SrcAddress<VAddr>(),
+                    (unsigned long long)dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+    }
     ASSERT(dma_data->command.das == 0);
     if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
         rasterizer.FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),

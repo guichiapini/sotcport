@@ -88,6 +88,7 @@ void runtime_thread_attach_host(const char *name);
 uintptr_t runtime_sotc_resolve(const char *name);
 uintptr_t runtime_sotc_resolve_data(const char *name);
 void runtime_sotc_start(void);
+void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size);
 uintptr_t runtime_fiber_resolve(const char *name);
 uintptr_t runtime_ngs2_resolve(const char *name);
 uintptr_t runtime_audio3d_resolve(const char *name);

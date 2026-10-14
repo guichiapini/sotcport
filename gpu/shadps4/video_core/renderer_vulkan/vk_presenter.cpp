@@ -319,9 +319,10 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 // bbport: raw copy of an image for BB_FRAME_DUMP_TRIGGER, written once the GPU is done.
 static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                     vk::Image image, vk::ImageLayout layout, u32 w, u32 h, const char* name,
-                    int index) {
+                    int index, u32 bytes_per_pixel = 4,
+                    vk::ImageAspectFlagBits aspect = vk::ImageAspectFlagBits::eColor) {
     const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                       .size = VkDeviceSize(w) * h * 4,
+                                       .size = VkDeviceSize(w) * h * bytes_per_pixel,
                                        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     const VmaAllocationCreateInfo alloc_ci{
         .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
@@ -334,7 +335,7 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
         return;
     }
     cmdbuf.copyImageToBuffer(image, layout, buffer,
-                             vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                             vk::BufferImageCopy{.imageSubresource = {aspect, 0, 0, 1},
                                                  .imageExtent = {w, h, 1}});
     const char* dir = std::getenv("BB_DUMP_DIR");
     char path[512];
@@ -436,6 +437,42 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
                     vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
                     image.info.size.height, "display", frame_dump_index);
+            // bbport (sotc): BB_DUMP_IMAGES=<hex address>,...: render targets the frame left
+            // there (G-buffer, depth), written as img<address>_<bytes per pixel>bpp_<index>.
+            if (const char* list = std::getenv("BB_DUMP_IMAGES")) {
+                for (const char* p = list; *p;) {
+                    char* end = nullptr;
+                    const VAddr address = std::strtoull(p, &end, 16);
+                    if (end == p) {
+                        break;
+                    }
+                    p = *end == ',' ? end + 1 : end;
+                    std::vector<VideoCore::ImageId> found;
+                    texture_cache.ForEachImageInRegion(address, 1, [&](VideoCore::ImageId id,
+                                                                       VideoCore::Image& img) {
+                        if (img.info.guest_address == address) {
+                            found.push_back(id);
+                        }
+                    });
+                    for (const auto id : found) {
+                        auto& target = texture_cache.GetImage(id);
+                        const bool depth = bool(target.aspect_mask & vk::ImageAspectFlagBits::eDepth);
+                        const u32 bpp = depth ? 4 : std::max(1u, target.info.num_bits / 8);
+                        runtime.Transit(&target, vk::ImageLayout::eTransferSrcOptimal,
+                                        vk::PipelineStageFlagBits2::eTransfer,
+                                        vk::AccessFlagBits2::eTransferRead);
+                        runtime.FlushBarriers();
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "img%llx_%ubpp%s",
+                                      (unsigned long long)address, bpp, depth ? "_depth" : "");
+                        DumpRaw(instance, draw_scheduler, cmdbuf, target.GetImage(),
+                                vk::ImageLayout::eTransferSrcOptimal, target.info.size.width,
+                                target.info.size.height, name, frame_dump_index, bpp,
+                                depth ? vk::ImageAspectFlagBits::eDepth
+                                      : vk::ImageAspectFlagBits::eColor);
+                    }
+                }
+            }
         }
         image_view = *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};

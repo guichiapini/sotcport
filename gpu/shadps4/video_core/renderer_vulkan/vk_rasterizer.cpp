@@ -1211,22 +1211,31 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
-
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer();
-    }
-
+    // bbport (sotc): the argument and count buffers are obtained before the vertex and index
+    // buffers are bound. Obtaining them can upload or create buffers and move recording to
+    // another command buffer, and the draw then ran without the bindings recorded before
+    // (validation: no index buffer, no vertex input). CUSA08809 draws its scenery this way.
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
 
-    const VideoCore::Buffer* count_buffer;
-    u64 count_offset;
+    const VideoCore::Buffer* count_buffer = nullptr;
+    u64 count_offset = 0;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+    }
+
+    // Both resolved before either is recorded, as in DrawRecord: resolving the index buffer
+    // can move recording too.
+    ResolveVertexBuffers(pipeline, nullptr);
+    if (is_indexed) {
+        ResolveIndexBuffer(0);
+    }
+    const auto state = BeginRendering(pipeline);
+    EmitVertexBuffers();
+    if (is_indexed) {
+        EmitIndexBuffer();
     }
 
     if (needs_barrier) {
@@ -1252,7 +1261,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const vk::Pipeline handle = pipeline->Handle();
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
-    const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
+    // bbport (sotc): BB_IGNORE_INDIRECT_COUNT=1 draws every argument slot (diagnostics: tells a
+    // GPU-written draw count of zero from draws that do not render).
+    static const bool ignore_count = [] {
+        const char* v = std::getenv("BB_IGNORE_INDIRECT_COUNT");
+        return v && v[0] == '1';
+    }();
+    const vk::Buffer counts =
+        count_address != 0 && !ignore_count ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
@@ -2132,9 +2148,34 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
+                // bbport (sotc): CUSA08809 declares unbounded buffers (num_records ~4 GiB)
+                // thousands of times a second; the first few are enough.
+                static std::atomic<int> clamp_logs{0};
+                if (size != vsharp.GetSize() && clamp_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
+                }
+                // bbport (sotc): BB_WATCH=<hex>: shaders that bind a written buffer over it.
+                static const VAddr watch = [] {
+                    const char* w = std::getenv("BB_WATCH");
+                    return w ? VAddr(std::strtoull(w, nullptr, 16)) : VAddr(0);
+                }();
+                // BB_WATCH_SIZE=<bytes>: likewise for written buffers of that size (addresses
+                // change from run to run).
+                static const u64 watch_size = [] {
+                    const char* w = std::getenv("BB_WATCH_SIZE");
+                    return w ? u64(std::strtoull(w, nullptr, 10)) : u64(0);
+                }();
+                if (desc.is_written && ((watch && vsharp.base_address <= watch &&
+                                         watch < vsharp.base_address + size) ||
+                                        (watch_size && vsharp.GetSize() == watch_size))) {
+                    static std::atomic<int> watch_logs{0};
+                    if (watch_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        std::printf("Watch: stage %#llx writes buffer %#llx+%llu (slot %u)\n",
+                                    (unsigned long long)stage.pgm_hash,
+                                    (unsigned long long)vsharp.base_address,
+                                    (unsigned long long)size, binding.buffer);
+                    }
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);

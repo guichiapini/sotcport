@@ -322,6 +322,8 @@ static const struct { const char *name; void *function; } unnamed[]={
 /* BB_HEARTBEAT=<seconds>: periodic progress lines (frames shown, input, files, fibers), to tell
  * a game that waits from one that hangs in automated runs. */
 uint64_t bbgpu_flip_count(void);
+uint64_t runtime_file_bytes_read(void);
+uint64_t runtime_file_reads(void);
 #ifdef _WIN32
 void probe_dump_threads(void);
 #endif
@@ -340,6 +342,19 @@ static void *heartbeat(void *argument) {
         idle_periods=flips==last && flips ? idle_periods+1 : 0;
         if (idle_periods==2 && !dumped) { dumped=1; probe_dump_threads(); }
 #endif
+        static uint64_t last_bytes, last_reads;
+        uint64_t bytes=runtime_file_bytes_read(), n=runtime_file_reads();
+        fprintf(stderr,"Heartbeat %us: read %.1f MiB/s in %llu reads\n",elapsed,(double)(bytes-last_bytes)/period/1048576.0,
+                (unsigned long long)(n-last_reads));
+        last_bytes=bytes; last_reads=n;
+        /* BB_WATCH=<hex address>: the first 16 bytes there, as the host copy holds them. */
+        static uintptr_t watch=1;
+        if (watch==1) { const char *w=getenv("BB_WATCH"); watch=w ? (uintptr_t)strtoull(w,NULL,16) : 0; }
+        if (watch) {
+            uint32_t v[4]={0};
+            runtime_memory_read_backing(watch,v,sizeof(v));
+            fprintf(stderr,"Heartbeat %us: watch %#llx = %08x %08x %08x %08x\n",elapsed,(unsigned long long)watch,v[0],v[1],v[2],v[3]);
+        }
         last=flips;
     }
     return NULL;
