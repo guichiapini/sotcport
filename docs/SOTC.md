@@ -12,7 +12,7 @@ bash build.sh                     # MSYS2 CLANG64 (see msys2-env.sh)
 python tools/sotc/run_sotc.py     # prepares out/sotc from the dump on first use, then starts
 ```
 
-`run_sotc.py` reads the dump from `D:\Shadow of the Colossus PC\CUSA08809` (`SOTC_GAME` to
+`run_sotc.py` reads the dump from `D:\Shadow of the Colossus PC\CUSA08809` (`SOTC_GAME_DIR` to
 change it), keeps saves and caches in `out/sotc-user`, and sets the defaults the game needs:
 
 | Variable | Default | Why |
