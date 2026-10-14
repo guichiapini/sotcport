@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdio>
+#include <deque>
+#include <string>
+#include <unordered_map>
+#include <fmt/format.h>
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -36,6 +40,41 @@ Semaphore::~Semaphore() {
 /// that never signals blocks the queue for all that follow).
 std::mutex Semaphore::registry_mutex;
 std::vector<Semaphore*> Semaphore::registry;
+
+namespace {
+std::mutex shaders_mutex;
+std::unordered_map<u64, u32> open_shaders;
+std::deque<std::pair<u64, std::vector<std::pair<u64, u32>>>> closed_shaders;
+} // namespace
+
+void Semaphore::NoteShader(u64 hash) {
+    std::scoped_lock lk{shaders_mutex};
+    ++open_shaders[hash];
+}
+
+void Semaphore::CloseSubmission(u64 tick) {
+    std::scoped_lock lk{shaders_mutex};
+    closed_shaders.emplace_back(tick, std::vector<std::pair<u64, u32>>(open_shaders.begin(),
+                                                                       open_shaders.end()));
+    open_shaders.clear();
+    while (closed_shaders.size() > 16) {
+        closed_shaders.pop_front();
+    }
+}
+
+void Semaphore::ReportShaders(u64 tick) {
+    std::scoped_lock lk{shaders_mutex};
+    for (const auto& [t, shaders] : closed_shaders) {
+        if (t != tick) {
+            continue;
+        }
+        std::string line = fmt::format("  submission {} ran {} programs:", t, shaders.size());
+        for (const auto& [hash, count] : shaders) {
+            line += fmt::format(" {:08x}x{}", hash, count);
+        }
+        std::puts(line.c_str());
+    }
+}
 
 void Semaphore::Refresh() {
     u64 this_tick{};
@@ -85,6 +124,7 @@ void Semaphore::Wait(u64 tick) {
                     ++stalls, (unsigned long long)tick, (unsigned long long)counter,
                     (unsigned long long)CurrentTick());
         if (stalls == 1) {
+            ReportShaders(tick);
             std::scoped_lock lk{registry_mutex};
             for (Semaphore* s : registry) {
                 auto [r, value] = instance.GetDevice().getSemaphoreCounterValue(s->Handle());

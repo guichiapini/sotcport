@@ -51,6 +51,12 @@ public:
     static std::mutex registry_mutex;
     static std::vector<Semaphore*> registry;
 
+    /// bbport (sotc): shaders recorded per submission, for stall reports: a submission the
+    /// GPU never finishes names the programs it ran (one looping to its guard, typically).
+    static void NoteShader(u64 hash);
+    static void CloseSubmission(u64 tick);
+    static void ReportShaders(u64 tick);
+
 protected:
     const Instance& instance;
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.

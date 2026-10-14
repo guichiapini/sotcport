@@ -1156,6 +1156,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
     });
+    Semaphore::NoteShader(vs_info.pgm_hash);
+    if (const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)]) {
+        Semaphore::NoteShader(fs->pgm_hash);
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1347,6 +1351,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) {
+            Semaphore::NoteShader(stage->pgm_hash);
+        }
+    }
     if (FrameCapture::Active()) {
         const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1449,6 +1458,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    Semaphore::NoteShader(cs.pgm_hash);
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -2494,6 +2504,33 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
         if (warn_meta && texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+        }
+        // bbport (sotc): BB_IMAGE_WATCH=<hex hash>[,...]: the images those shaders bind (format,
+        // size, address), now and then.
+        static const std::vector<u64> image_watch = [] {
+            std::vector<u64> list;
+            if (const char* v = std::getenv("BB_IMAGE_WATCH")) {
+                for (const char* p = v; *p;) {
+                    char* end = nullptr;
+                    list.push_back(std::strtoull(p, &end, 16));
+                    if (end == p) break;
+                    p = *end == ',' ? end + 1 : end;
+                }
+            }
+            return list;
+        }();
+        if (!image_watch.empty() &&
+            std::ranges::find(image_watch, u64(u32(stage.pgm_hash))) != image_watch.end()) {
+            static std::atomic<u32> watch_shown{0};
+            if (watch_shown.fetch_add(1, std::memory_order_relaxed) % 500 < 4) {
+                std::printf("Image watch: shader %08x image %u at %#llx dfmt %u nfmt %u %ux%u "
+                            "type %u, read %d written %d atomic %d\n",
+                            u32(stage.pgm_hash), image_index,
+                            (unsigned long long)tsharp.Address(), u32(tsharp.GetDataFmt()),
+                            u32(tsharp.GetNumberFmt()), u32(tsharp.width + 1), u32(tsharp.height + 1),
+                            u32(tsharp.GetType()), int(image_desc.is_depth), int(image_desc.is_written),
+                            int(image_desc.is_atomic));
+            }
         }
 
         const auto data_fmt = tsharp.GetDataFmt();

@@ -114,6 +114,29 @@ void Runtime::TickFrame() {
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
+    // bbport (sotc): BB_GPU_PROFILE: buffer copies (uploads, readbacks) get their own segment
+    // by size, instead of adding to the draw or dispatch recorded before them.
+    struct CopyMark {
+        GpuProfiler* profiler = nullptr;
+        u64 resume = 0;
+        ~CopyMark() {
+            if (profiler && resume) {
+                profiler->Resume(resume);
+            }
+        }
+    } mark;
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(&scheduler)) {
+        u64 total = 0;
+        for (const auto& copy : copies) {
+            total += copy.size;
+        }
+        const u32 bucket = std::bit_width(total);
+        mark.profiler = profiler;
+        mark.resume = profiler->Current();
+        profiler->Mark(0xB0FC0000ull ^ bucket, [&] {
+            return fmt::format("buffer copy up to {} KiB", (u64{1} << bucket) >> 10);
+        });
+    }
 
     // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
     // conservative for barriers, and two tree lookups instead of two per region.
