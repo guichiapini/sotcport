@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -153,8 +154,15 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 // bbport (sotc): loop back edges an invocation may take before every loop exits. Translated
 // loops whose exit depends on data the port gets wrong otherwise spin until the driver resets
-// the device; real shaders stay far below this.
-constexpr u32 MaxLoopIterations = 1u << 16;
+// the device; real shaders stay far below this. BB_LOOP_GUARD=N changes it (0: no guard);
+// pipeline caches do not record it: clear the GPU cache folder after changing it.
+static u32 MaxLoopIterations() {
+    static const u32 value = [] {
+        const char* v = std::getenv("BB_LOOP_GUARD");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 1u << 16;
+    }();
+    return value;
+}
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
@@ -168,7 +176,7 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
-            if (!Sirit::ValidId(loop_counter)) {
+            if (!Sirit::ValidId(loop_counter) && MaxLoopIterations() != 0) {
                 // Function variables go first in the entry block.
                 loop_counter = ctx.DefineVar<false>(ctx.U32[1], spv::StorageClass::Function,
                                                     ctx.u32_zero_value);
@@ -208,12 +216,14 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
-            const Id taken{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], loop_counter),
-                                      ctx.ConstU32(1u))};
-            ctx.OpStore(loop_counter, taken);
-            cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
-                                    ctx.OpULessThan(ctx.U1[1], taken,
-                                                    ctx.ConstU32(MaxLoopIterations)));
+            if (Sirit::ValidId(loop_counter)) {
+                const Id taken{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], loop_counter),
+                                          ctx.ConstU32(1u))};
+                ctx.OpStore(loop_counter, taken);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], taken,
+                                                        ctx.ConstU32(MaxLoopIterations())));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
