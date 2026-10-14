@@ -23,9 +23,19 @@ Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     ASSERT_MSG(semaphore_result == vk::Result::eSuccess, "Failed to create master semaphore: {}",
                vk::to_string(semaphore_result));
     semaphore = std::move(sem);
+    std::scoped_lock lk{registry_mutex};
+    registry.push_back(this);
 }
 
-Semaphore::~Semaphore() = default;
+Semaphore::~Semaphore() {
+    std::scoped_lock lk{registry_mutex};
+    std::erase(registry, this);
+}
+
+/// bbport (sotc): every timeline semaphore, for stall reports (a submission waiting on one
+/// that never signals blocks the queue for all that follow).
+std::mutex Semaphore::registry_mutex;
+std::vector<Semaphore*> Semaphore::registry;
 
 void Semaphore::Refresh() {
     u64 this_tick{};
@@ -74,6 +84,15 @@ void Semaphore::Wait(u64 tick) {
         std::printf("Semaphore stall #%u: waiting tick %llu, gpu counter %llu, next %llu\n",
                     ++stalls, (unsigned long long)tick, (unsigned long long)counter,
                     (unsigned long long)CurrentTick());
+        if (stalls == 1) {
+            std::scoped_lock lk{registry_mutex};
+            for (Semaphore* s : registry) {
+                auto [r, value] = instance.GetDevice().getSemaphoreCounterValue(s->Handle());
+                std::printf("  timeline semaphore %p: gpu %llu, last asked %llu%s\n", (void*)s,
+                            (unsigned long long)value, (unsigned long long)(s->CurrentTick() - 1),
+                            value + 1 < s->CurrentTick() ? "  <- behind" : "");
+            }
+        }
         std::fflush(stdout);
     }
     Refresh();

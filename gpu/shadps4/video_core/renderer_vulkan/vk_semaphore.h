@@ -6,7 +6,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <mutex>
 #include <queue>
+#include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -45,6 +47,9 @@ public:
 
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
+
+    static std::mutex registry_mutex;
+    static std::vector<Semaphore*> registry;
 
 protected:
     const Instance& instance;

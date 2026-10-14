@@ -329,7 +329,7 @@ vk::SamplerAddressMode ClampMode(AmdGpu::ClampMode mode) {
     case AmdGpu::ClampMode::ClampBorder:
         return vk::SamplerAddressMode::eClampToBorder;
     default:
-        UNREACHABLE();
+        return vk::SamplerAddressMode::eClampToEdge; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -352,7 +352,7 @@ vk::CompareOp DepthCompare(AmdGpu::DepthCompare comp) {
     case AmdGpu::DepthCompare::Always:
         return vk::CompareOp::eAlways;
     default:
-        UNREACHABLE();
+        return vk::CompareOp::eNever; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -365,7 +365,7 @@ vk::Filter Filter(AmdGpu::Filter filter) {
     case AmdGpu::Filter::AnisoLinear:
         return vk::Filter::eLinear;
     default:
-        UNREACHABLE();
+        return vk::Filter::eLinear; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -378,7 +378,7 @@ vk::SamplerReductionMode FilterMode(AmdGpu::FilterMode mode) {
     case AmdGpu::FilterMode::Max:
         return vk::SamplerReductionMode::eMax;
     default:
-        UNREACHABLE();
+        return vk::SamplerReductionMode::eWeightedAverage; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -391,7 +391,7 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter) {
     case AmdGpu::MipFilter::None:
         return vk::SamplerMipmapMode::eNearest;
     default:
-        UNREACHABLE();
+        return vk::SamplerMipmapMode::eNearest; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -406,7 +406,7 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color) {
     case AmdGpu::BorderColor::Custom:
         return vk::BorderColor::eFloatCustomEXT;
     default:
-        UNREACHABLE();
+        return vk::BorderColor::eFloatTransparentBlack; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 
@@ -425,7 +425,7 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
     default:
-        UNREACHABLE();
+        return vk::ComponentSwizzle::eIdentity; // bbport (sotc): reserved value of a garbage descriptor
     }
 }
 

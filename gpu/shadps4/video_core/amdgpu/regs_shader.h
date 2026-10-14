@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/types.h"
 #include "shader_recompiler/params.h"
@@ -228,6 +230,18 @@ static const BinaryInfo& SearchBinaryInfo(const u32* code) {
         if (info->Valid()) {
             return *info;
         }
+    }
+    // bbport (sotc): a program register pointing at no shader (stale state while an area
+    // loads) found the signature of some later shader in the search below, and decoding its
+    // own bytes as code aborted ("illegal encoding"). Every CUSA08809 shader starts with the
+    // token; without it the work is skipped (BB_SHADER_SEARCH=1 restores the search).
+    static const bool search = [] {
+        const char* v = std::getenv("BB_SHADER_SEARCH");
+        return v && v[0] == '1';
+    }();
+    if (!search) {
+        static const BinaryInfo none{};
+        return none;
     }
     constexpr u32 signature_size = sizeof(BinaryInfo::signature_ref) / sizeof(u8);
     constexpr u32 search_limit = 0x4000;
