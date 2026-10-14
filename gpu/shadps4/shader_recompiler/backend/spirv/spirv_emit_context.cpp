@@ -1221,8 +1221,10 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto available_label{OpLabel()};
     const auto merge_label{OpLabel()};
 
-    // Get page BDA
-    const auto page{OpShiftRightLogical(U64, address, caching_pagebits)};
+    // Get page BDA. bbport (sotc): the GPU decodes 40 address bits; higher ones (the stride of
+    // a buffer descriptor read as a pointer) are ignored, as by the hardware.
+    const auto address40{OpBitwiseAnd(U64, address, Constant(U64, (u64{1} << 40) - 1))};
+    const auto page{OpShiftRightLogical(U64, address40, caching_pagebits)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
     // bbport (sotc): an address past the page table (a garbage pointer, e.g. one the SRT walker
@@ -1230,7 +1232,7 @@ Id EmitContext::DefineGetBdaPointer() {
     // faulted and the driver ended the process. Such pages read as unavailable (null), and page 0
     // stands in for them in both table accesses. The table has an entry for each page of the
     // buffer cache's 40-bit address space (BufferCache::ADDRESS_SPACE_BITS).
-    const auto in_range{OpULessThan(U1[1], address, Constant(U64, u64{1} << 40))};
+    const auto in_range{OpULessThan(U1[1], address40, Constant(U64, u64{1} << 40))};
     const auto page32{OpSelect(U32[1], in_range, OpUConvert(U32[1], page), u32_zero_value)};
     const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
     const auto bda{OpLoad(U64, bda_ptr)};

@@ -649,7 +649,10 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
         c.mov(r10d, r10d);
         c.mov(rdi, ptr[rdi + r10]);
     }
-    c.mov(r10, 0xFFFFFFFFFFFFULL);
+    // bbport (sotc): as the GPU reads it: 40 address bits (descriptors read as pointers carry
+    // their stride above them) and dword alignment for scalar loads. The 48-bit mask left
+    // pointers like 0x27120146141d (0x120146141c) that faulted while areas loaded.
+    c.mov(r10, 0xFFFFFFFFFCULL);
     c.and_(rdi, r10);
     return true;
 }
