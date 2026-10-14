@@ -432,6 +432,18 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    // bbport (sotc): it runs before every dispatch or draw of a shader reading guest memory
+    // directly (over a thousand culling dispatches a frame in CUSA08809's main menu) and walks
+    // all resident memory. Pages only need uploading after something marked them CPU-modified
+    // (a write fault) or memory became resident; hot pages stay modified without faults.
+    const u64 generation = RegionManager::cpu_mark_generation.load(std::memory_order_acquire);
+    if (generation == dma_synced_generation && resident_version == dma_synced_resident &&
+        BbStats::hot_pages.load(std::memory_order_relaxed) == 0 &&
+        !BbToggle::Disabled(BbToggle::PageTrackingEarlyExit)) {
+        return;
+    }
+    dma_synced_generation = generation;
+    dma_synced_resident = resident_version;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -552,6 +564,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_offset;
         resident_ranges.Add(backing);
+        ++resident_version;
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 

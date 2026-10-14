@@ -94,6 +94,7 @@ public:
 
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (type == Type::CPU && enable) {
+            cpu_mark_generation.fetch_add(1, std::memory_order_release);
             CountWriteFaults(start_page, end_page);
         }
         if constexpr (enable) {
@@ -110,6 +111,11 @@ public:
 
     /// bbport: after a guest write fault, also unprotects the other pages of the window that
     /// are protected for CPU writes and hold no GPU-modified data (see MarkFaultWindow).
+    /// bbport (sotc): counts the times pages were marked CPU-modified, so work that uploads
+    /// every CPU-modified page (BufferCache::SynchronizeDmaBuffers) can skip when nothing new
+    /// was marked since it last ran.
+    static inline std::atomic<u64> cpu_mark_generation{0};
+
     void ExtendWriteFault(VAddr window_addr, u64 size) {
         const size_t offset = window_addr - cpu_addr;
         const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
@@ -123,6 +129,7 @@ public:
             return;
         }
         cpu |= add;
+        cpu_mark_generation.fetch_add(1, std::memory_order_release);
         UpdateProtection<false, false>();
     }
 

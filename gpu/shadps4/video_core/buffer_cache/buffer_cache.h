@@ -195,6 +195,9 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    u64 resident_version{};          ///< bbport: bumped as memory becomes resident
+    u64 dma_synced_generation{~0ull}; ///< bbport: state SynchronizeDmaBuffers last saw
+    u64 dma_synced_resident{~0ull};
 
     u32 arena_memory_type_index{};
     u32 block_size{};
